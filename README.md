@@ -11,13 +11,13 @@ Requires [i3ipc-python](https://github.com/altdesktop/i3ipc-python).
 ## Usage
 
 ```
-python3 swaymonad.py [--verbose] [--log-file PATH]
+python3 sway_xmonad_tall.py [--verbose] [--log-file PATH]
 ```
 
 Add to your sway config to start automatically:
 
 ```
-exec python3 /path/to/swaymonad.py
+exec python3 /path/to/sway_xmonad_tall.py
 ```
 
 ## Sway config
@@ -49,7 +49,7 @@ bindsym $mod+l nop move_divider right
 bindsym $mod+f nop fullscreen
 
 # Optional but recommended sway bindings
-# Real sway fullscreen (bypass swaymonad, use sway directly)
+# Real sway fullscreen (bypass sway-xmonad-tall, use sway directly)
 bindsym $mod+Shift+f fullscreen
 # Resize individual container vertically
 bindsym $mod+a resize grow height 20px
