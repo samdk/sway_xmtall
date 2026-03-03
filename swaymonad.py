@@ -93,7 +93,7 @@ def add_to_front(state: WorkspaceState, column: i3ipc.Con, node: i3ipc.Con) -> N
     move_container(state, node, column)
     return
   first = column.nodes[0]
-  state.pending_moves += 1
+  state.pending_moves += 2  # move-to-mark + move-up each trigger a move event
   first.command("mark --add __swaymonad_mark")
   node.command("move window to mark __swaymonad_mark")
   first.command("unmark __swaymonad_mark")
@@ -496,16 +496,16 @@ def cmd_fullscreen(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   state = get_state(i3, ws)
   state.snapshot = refetch(i3, ws)
 
-def cmd_resize(i3: i3ipc.Connection, event: i3ipc.Event, direction: str, *args) -> None:
+def cmd_resize(i3: i3ipc.Connection, event: i3ipc.Event, direction: str, amount: str = "50px", *args) -> None:
   ws = get_focused_workspace(i3)
   if not ws or len(ws.nodes) < 2:
     return
   state = get_state(i3, ws)
   lcol = ws.nodes[0]
   if direction == "grow":
-    lcol.command("resize grow width 50px")
+    lcol.command(f"resize grow width {amount}")
   elif direction == "shrink":
-    lcol.command("resize shrink width 50px")
+    lcol.command(f"resize shrink width {amount}")
   ws = refetch(i3, ws)
   if ws and len(ws.nodes) >= 2:
     state.last_rcol_width = ws.nodes[1].rect.width
@@ -534,6 +534,7 @@ def cmd_zoom(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
           if zoomed and state.zoom_neighbor_id in leaf_ids:
             neighbor = i3.get_tree().find_by_id(state.zoom_neighbor_id)
             if neighbor:
+              state.pending_moves += 2
               neighbor.command("mark --add __swaymonad_mark")
               zoomed.command("move window to mark __swaymonad_mark")
               neighbor.command("unmark __swaymonad_mark")
@@ -549,15 +550,20 @@ def cmd_zoom(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
 
   # Toggle on: zoom
   state.zoomed_id = focused.id
-  # Find next window in tiling order for position restore
-  neighbor = find_offset_window(focused, 1)
-  state.zoom_neighbor_id = neighbor.id if neighbor and neighbor.id != focused.id else None
+  # Find next window in tiling order for position restore (without wrapping)
+  leaves = ws.leaves()
+  leaf_ids = [l.id for l in leaves]
+  try:
+    idx = leaf_ids.index(focused.id)
+    state.zoom_neighbor_id = leaf_ids[idx + 1] if idx + 1 < len(leaf_ids) else None
+  except ValueError:
+    state.zoom_neighbor_id = None
   # Float and fill workspace rect
   r = ws.rect
   focused.command(
     f"floating enable, border none, "
-    f"move absolute position {r.x} {r.y}, "
-    f"resize set {r.width} {r.height}"
+    f"resize set {r.width} px {r.height} px, "
+    f"move absolute position {r.x} px {r.y} px"
   )
   do_reflow(i3, state)
   state.snapshot = refetch(i3, ws)
