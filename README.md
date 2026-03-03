@@ -4,7 +4,7 @@ An xmonad-like auto-tiler for sway. Roughly implements a xmonad's default
 "tall" layout: primary column on the left, secondary column on the right.
 Effectively a simplified rewrite of
 [swaymonad](https://github.com/nicolasavru/swaymonad) with fewer features and
-less code.)
+less code.
 
 (Almost all of the actual rewrite was done with Claude Opus 4.6, based on a mix
 of the original swaymonad and a private fork.)
