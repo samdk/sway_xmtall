@@ -1,4 +1,4 @@
-# sway-xmonad-tall
+# sway-xmtall
 
 An xmonad-like auto-tiler for sway. Implements a "tall" layout: primary column
 on the left, secondary column on the right. Effectively a simplified rewrite of
@@ -11,13 +11,13 @@ Requires [i3ipc-python](https://github.com/altdesktop/i3ipc-python).
 ## Usage
 
 ```
-python3 sway_xmonad_tall.py [--verbose] [--log-file PATH]
+python3 sway_xmtall.py [--verbose] [--log-file PATH]
 ```
 
 Add to your sway config to start automatically:
 
 ```
-exec python3 /path/to/sway_xmonad_tall.py
+exec python3 /path/to/sway_xmtall.py
 ```
 
 ## Sway config
@@ -49,7 +49,7 @@ bindsym $mod+l nop move_divider right
 bindsym $mod+f nop fullscreen
 
 # Optional but recommended sway bindings
-# Real sway fullscreen (bypass sway-xmonad-tall, use sway directly)
+# Real sway fullscreen (bypass sway-xmtall, use sway directly)
 bindsym $mod+Shift+f fullscreen
 # Resize individual container vertically
 bindsym $mod+a resize grow height 20px

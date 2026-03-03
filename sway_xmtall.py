@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sway-xmonad-tall: an xmonad-like auto-tiler for sway.
+"""sway-xmtall: an xmonad-like auto-tiler for sway.
 Implements a 'tall' layout: primary column on the left,
 secondary column on the right."""
 
@@ -73,7 +73,7 @@ def is_floating(container: i3ipc.Con) -> bool:
 
 # -- Move helpers -------------------------------------------------------------
 
-MARK = "__sway_xmonad_tall_mark"
+MARK = "__sway_xmtall_mark"
 
 def command_move(state: WorkspaceState, node: i3ipc.Con, move_args: str) -> None:
   """Issue a move command on node, suppressing the resulting move event."""
@@ -617,7 +617,7 @@ class Connection(i3ipc.Connection):
 
 # -- Main ---------------------------------------------------------------------
 
-argparser = argparse.ArgumentParser(description='sway-xmonad-tall: an xmonad-like auto-tiler for sway.')
+argparser = argparse.ArgumentParser(description='sway-xmtall: an xmonad-like auto-tiler for sway.')
 argparser.add_argument('--verbose', '-v', action='count', help="Enable debug logging.")
 argparser.add_argument('--log-file', help="Log file path (default: stderr).")
 argparser.add_argument('--delay', default=0.0, type=float,
