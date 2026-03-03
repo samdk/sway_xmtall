@@ -70,35 +70,32 @@ def is_floating(container: i3ipc.Con) -> bool:
   return container.floating in ['user_on', 'auto_on'] or container.type == "floating_con"
 
 
-def tree_str(container: i3ipc.Con, indent: str = "") -> str:
-  out = f"{indent}{container.id} {container.layout}\n"
-  for node in container.nodes:
-    out += tree_str(node, indent + "  ")
-  return out
-
-
 # -- Move helpers -------------------------------------------------------------
 
-def move_container(state: WorkspaceState, node: i3ipc.Con, target: i3ipc.Con) -> None:
-  """Move node into target's container using mark-based move."""
-  state.pending_moves += 1
-  target.command("mark --add __swaymonad_mark")
-  node.command("move window to mark __swaymonad_mark")
-  target.command("unmark __swaymonad_mark")
+MARK = "__swaymonad_mark"
 
+def command_move(state: WorkspaceState, node: i3ipc.Con, move_args: str) -> None:
+  """Issue a move command on node, suppressing the resulting move event."""
+  state.pending_moves += 1
+  node.command(f"move {move_args}")
+
+def move_to_target(state: WorkspaceState, node: i3ipc.Con, target: i3ipc.Con) -> None:
+  """Move node to be a sibling after target, using a mark."""
+  target.command(f"mark --add {MARK}")
+  command_move(state, node, f"window to mark {MARK}")
+  target.command(f"unmark {MARK}")
+
+def move_before(state: WorkspaceState, node: i3ipc.Con, target: i3ipc.Con) -> None:
+  """Move node to just before target in its container."""
+  move_to_target(state, node, target)
+  command_move(state, node, "up")
 
 def add_to_front(state: WorkspaceState, column: i3ipc.Con, node: i3ipc.Con) -> None:
-  """Move node to the front (top) of column. O(1) IPC commands."""
+  """Move node to the front (top) of column."""
   if not column.nodes:
-    move_container(state, node, column)
+    move_to_target(state, node, column)
     return
-  first = column.nodes[0]
-  state.pending_moves += 2  # move-to-mark + move-up each trigger a move event
-  first.command("mark --add __swaymonad_mark")
-  node.command("move window to mark __swaymonad_mark")
-  first.command("unmark __swaymonad_mark")
-  # node is now after first; shift it before first
-  node.command("move up")
+  move_before(state, node, column.nodes[0])
 
 
 # -- Window operations --------------------------------------------------------
@@ -178,16 +175,15 @@ def ensure_two_columns(i3: i3ipc.Connection, state: WorkspaceState,
     extra = workspace.nodes[-1]
     target = workspace.nodes[1]
     for node in list(extra.nodes):
-      move_container(state, node, target)
+      move_to_target(state, node, target)
     workspace = refetch(i3, workspace)
 
   # Split single column if we have more than n_lcol windows.
   if len(workspace.nodes) == 1:
     col = workspace.nodes[0]
     if len(col.nodes) > state.n_lcol:
-      state.pending_moves += 1
       focused = workspace.find_focused()
-      col.nodes[-1].command("move right")
+      command_move(state, col.nodes[-1], "right")
       if focused:
         focused.command("focus")
       workspace = refetch(i3, workspace)
@@ -210,7 +206,7 @@ def ensure_single_column(i3: i3ipc.Connection, state: WorkspaceState,
     last = workspace.nodes[-1]
     target = workspace.nodes[0]
     for node in list(last.nodes):
-      move_container(state, node, target)
+      move_to_target(state, node, target)
     workspace = refetch(i3, workspace)
   return workspace
 
@@ -243,7 +239,7 @@ def reflow(i3: i3ipc.Connection, state: WorkspaceState,
 
   # Balance: move windows between columns.
   if len(lcol.nodes) < state.n_lcol and rcol.nodes:
-    move_container(state, rcol.nodes[0], lcol)
+    move_to_target(state, rcol.nodes[0], lcol)
     return True
 
   if len(lcol.nodes) > state.n_lcol and len(lcol.nodes) > 1:
@@ -452,7 +448,7 @@ def cmd_swap_next(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
 def cmd_swap_prev(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   swap_with_offset(i3, -1)
 
-def cmd_flow_left(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
+def adjust_n_lcol(i3: i3ipc.Connection, delta: int) -> None:
   ws = get_focused_workspace(i3)
   if not ws:
     return
@@ -460,27 +456,18 @@ def cmd_flow_left(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   focused = get_focused_window(i3)
   n_leaves = len([l for l in ws.leaves() if not is_floating(l)])
   effective = max(0, min(state.n_lcol, n_leaves))
-  state.n_lcol = min(effective + 1, n_leaves)
-  logging.debug(f"flow_left: n_lcol={state.n_lcol}")
+  state.n_lcol = max(0, min(effective + delta, n_leaves))
+  logging.debug(f"adjust_n_lcol: n_lcol={state.n_lcol}")
   do_reflow(i3, state)
   if focused:
     focused.command("focus")
   state.snapshot = refetch(i3, ws)
 
+def cmd_flow_left(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
+  adjust_n_lcol(i3, 1)
+
 def cmd_flow_right(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
-  ws = get_focused_workspace(i3)
-  if not ws:
-    return
-  state = get_state(i3, ws)
-  focused = get_focused_window(i3)
-  n_leaves = len([l for l in ws.leaves() if not is_floating(l)])
-  effective = max(0, min(state.n_lcol, n_leaves))
-  state.n_lcol = max(effective - 1, 0)
-  logging.debug(f"flow_right: n_lcol={state.n_lcol}")
-  do_reflow(i3, state)
-  if focused:
-    focused.command("focus")
-  state.snapshot = refetch(i3, ws)
+  adjust_n_lcol(i3, -1)
 
 def cmd_move_divider(i3: i3ipc.Connection, event: i3ipc.Event, direction: str, amount: str = "50px", *args) -> None:
   ws = get_focused_workspace(i3)
@@ -520,11 +507,7 @@ def cmd_zoom(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
           if zoomed and state.zoom_neighbor_id in leaf_ids:
             neighbor = i3.get_tree().find_by_id(state.zoom_neighbor_id)
             if neighbor:
-              state.pending_moves += 2
-              neighbor.command("mark --add __swaymonad_mark")
-              zoomed.command("move window to mark __swaymonad_mark")
-              neighbor.command("unmark __swaymonad_mark")
-              zoomed.command("move up")
+              move_before(state, zoomed, neighbor)
               do_reflow(i3, state)
       zoomed = refetch(i3, zoomed)
       if zoomed:
