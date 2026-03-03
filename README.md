@@ -1,4 +1,4 @@
-# swaymonad
+# sway-xmonad-tall
 
 An xmonad-like auto-tiler for sway. Implements a "tall" layout: primary column
 on the left, secondary column on the right. Effectively a simplified rewrite of
