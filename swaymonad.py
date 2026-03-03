@@ -452,7 +452,7 @@ def cmd_swap_next(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
 def cmd_swap_prev(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   swap_with_offset(i3, -1)
 
-def cmd_increment_lcol(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
+def cmd_flow_left(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   ws = get_focused_workspace(i3)
   if not ws:
     return
@@ -461,13 +461,13 @@ def cmd_increment_lcol(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   n_leaves = len([l for l in ws.leaves() if not is_floating(l)])
   effective = max(0, min(state.n_lcol, n_leaves))
   state.n_lcol = min(effective + 1, n_leaves)
-  logging.debug(f"Incremented n_lcol to {state.n_lcol}.")
+  logging.debug(f"flow_left: n_lcol={state.n_lcol}")
   do_reflow(i3, state)
   if focused:
     focused.command("focus")
   state.snapshot = refetch(i3, ws)
 
-def cmd_decrement_lcol(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
+def cmd_flow_right(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   ws = get_focused_workspace(i3)
   if not ws:
     return
@@ -476,7 +476,7 @@ def cmd_decrement_lcol(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   n_leaves = len([l for l in ws.leaves() if not is_floating(l)])
   effective = max(0, min(state.n_lcol, n_leaves))
   state.n_lcol = max(effective - 1, 0)
-  logging.debug(f"Decremented n_lcol to {state.n_lcol}.")
+  logging.debug(f"flow_right: n_lcol={state.n_lcol}")
   do_reflow(i3, state)
   if focused:
     focused.command("focus")
@@ -561,8 +561,8 @@ COMMANDS = {
   "focus_prev_window": cmd_focus_prev,
   "swap_with_next_window": cmd_swap_next,
   "swap_with_prev_window": cmd_swap_prev,
-  "increment_lcol": cmd_increment_lcol,
-  "decrement_lcol": cmd_decrement_lcol,
+  "flow_left": cmd_flow_left,
+  "flow_right": cmd_flow_right,
   "fullscreen": cmd_zoom,
   "resize": cmd_resize,
 }

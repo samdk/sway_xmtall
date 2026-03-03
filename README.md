@@ -35,8 +35,8 @@ bindsym $mod+Shift+k nop swap_with_prev_window
 bindsym $mod+Return nop promote_window
 
 # Increase/decrease the number of windows in the left column
-bindsym $mod+comma nop increment_lcol
-bindsym $mod+period nop decrement_lcol
+bindsym $mod+comma nop flow_left
+bindsym $mod+period nop flow_right
 
 # Resize the column divider (always moves the divider between columns)
 bindsym $mod+h nop resize shrink
@@ -59,7 +59,7 @@ bindsym $mod+Shift+f fullscreen
 | `swap_with_next_window` | Swap focused window with next |
 | `swap_with_prev_window` | Swap focused window with previous |
 | `promote_window` | Swap focused window with the largest window |
-| `increment_lcol` | Add one more window to the left column |
-| `decrement_lcol` | Remove one window from the left column |
-| `resize grow\|shrink` | Grow/shrink the left column by 50px. Always targets the left column so the divider moves consistently regardless of focus. |
+| `flow_left` | Move one window from the right -> left column |
+| `flow_right` | Move one window from the left -> right column |
+| `resize grow\|shrink [amount]` | Grow/shrink the left column. Always targets the left column so the divider moves consistently regardless of focus. Amount defaults to `50px`. |
 | `fullscreen` | Toggle zoom: float window to fill workspace rect without real fullscreen. Press again to restore tiling position. |
