@@ -1,9 +1,10 @@
 # sway-xmtall
 
-An xmonad-like auto-tiler for sway. Implements a "tall" layout: primary column
-on the left, secondary column on the right. Effectively a simplified rewrite of
-[swaymonad](https://github.com/nicolasavru/swaymonad) with reduced amounts of
-code, features, and bugs.
+An xmonad-like auto-tiler for sway. Roughly implements a xmonad's default
+"tall" layout: primary column on the left, secondary column on the right.
+Effectively a simplified rewrite of
+[swaymonad](https://github.com/nicolasavru/swaymonad) with fewer features and
+less code.)
 
 Requires [i3ipc-python](https://github.com/altdesktop/i3ipc-python).
 
@@ -17,7 +18,7 @@ python3 sway_xmtall.py [--verbose] [--log-file PATH]
 Add to your sway config to start automatically:
 
 ```
-exec python3 /path/to/sway_xmtall.py
+exec_always python3 path/to/sway_xmtall.py
 ```
 
 ## Sway config
