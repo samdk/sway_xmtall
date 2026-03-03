@@ -6,6 +6,9 @@ Effectively a simplified rewrite of
 [swaymonad](https://github.com/nicolasavru/swaymonad) with fewer features and
 less code.)
 
+(Almost all of the actual rewrite was done with Claude Opus 4.6, based on a mix
+of the original swaymonad and a private fork.)
+
 Requires [i3ipc-python](https://github.com/altdesktop/i3ipc-python).
 
 
