@@ -223,7 +223,7 @@ def reflow(i3: i3ipc.Connection, state: WorkspaceState,
   if len(leaves) <= 1:
     return False
 
-  if len(leaves) <= state.n_lcol:
+  if state.n_lcol == 0 or len(leaves) <= state.n_lcol:
     if len(workspace.nodes) > 1:
       ensure_single_column(i3, state, workspace)
       return True
@@ -458,7 +458,9 @@ def cmd_increment_lcol(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
     return
   state = get_state(i3, ws)
   focused = get_focused_window(i3)
-  state.n_lcol += 1
+  n_leaves = len([l for l in ws.leaves() if not is_floating(l)])
+  effective = max(0, min(state.n_lcol, n_leaves))
+  state.n_lcol = min(effective + 1, n_leaves)
   logging.debug(f"Incremented n_lcol to {state.n_lcol}.")
   do_reflow(i3, state)
   if focused:
@@ -471,29 +473,13 @@ def cmd_decrement_lcol(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
     return
   state = get_state(i3, ws)
   focused = get_focused_window(i3)
-  state.n_lcol = max(state.n_lcol - 1, 1)
+  n_leaves = len([l for l in ws.leaves() if not is_floating(l)])
+  effective = max(0, min(state.n_lcol, n_leaves))
+  state.n_lcol = max(effective - 1, 0)
   logging.debug(f"Decremented n_lcol to {state.n_lcol}.")
   do_reflow(i3, state)
   if focused:
     focused.command("focus")
-  state.snapshot = refetch(i3, ws)
-
-def cmd_move(i3: i3ipc.Connection, event: i3ipc.Event, direction: str, *args) -> None:
-  focused = get_focused_window(i3)
-  if not focused:
-    return
-  i3.command(f"focus {direction}")
-  target = get_focused_window(i3)
-  if target:
-    focused.command(f"swap container with con_id {target.id}")
-  focused.command("focus")
-
-def cmd_fullscreen(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
-  ws = get_focused_workspace(i3)
-  if not ws:
-    return
-  i3.command("fullscreen")
-  state = get_state(i3, ws)
   state.snapshot = refetch(i3, ws)
 
 def cmd_resize(i3: i3ipc.Connection, event: i3ipc.Event, direction: str, amount: str = "50px", *args) -> None:
@@ -575,11 +561,9 @@ COMMANDS = {
   "focus_prev_window": cmd_focus_prev,
   "swap_with_next_window": cmd_swap_next,
   "swap_with_prev_window": cmd_swap_prev,
-  "increment_masters": cmd_increment_lcol,
-  "decrement_masters": cmd_decrement_lcol,
-  "move": cmd_move,
+  "increment_lcol": cmd_increment_lcol,
+  "decrement_lcol": cmd_decrement_lcol,
   "fullscreen": cmd_zoom,
-  "real_fullscreen": cmd_fullscreen,
   "resize": cmd_resize,
 }
 

@@ -35,14 +35,8 @@ bindsym $mod+Shift+k nop swap_with_prev_window
 bindsym $mod+Return nop promote_window
 
 # Increase/decrease the number of windows in the left column
-bindsym $mod+comma nop increment_masters
-bindsym $mod+period nop decrement_masters
-
-# Move window in a direction (swaps with neighbor)
-bindsym $mod+Shift+h nop move left
-bindsym $mod+Shift+l nop move right
-bindsym $mod+Shift+k nop move up
-bindsym $mod+Shift+j nop move down
+bindsym $mod+comma nop increment_lcol
+bindsym $mod+period nop decrement_lcol
 
 # Resize the column divider (always moves the divider between columns)
 bindsym $mod+h nop resize shrink
@@ -52,8 +46,8 @@ bindsym $mod+l nop resize grow
 # (swaybar stays visible, Chrome keeps tabs, etc.)
 bindsym $mod+f nop fullscreen
 
-# Real sway fullscreen (if you ever need it)
-bindsym $mod+Shift+f nop real_fullscreen
+# Real sway fullscreen (bypass swaymonad, use sway directly)
+bindsym $mod+Shift+f fullscreen
 ```
 
 ## Commands
@@ -65,9 +59,7 @@ bindsym $mod+Shift+f nop real_fullscreen
 | `swap_with_next_window` | Swap focused window with next |
 | `swap_with_prev_window` | Swap focused window with previous |
 | `promote_window` | Swap focused window with the largest window |
-| `increment_masters` | Add one more window to the left column |
-| `decrement_masters` | Remove one window from the left column |
-| `move <direction>` | Swap focused window with its neighbor in the given direction |
+| `increment_lcol` | Add one more window to the left column |
+| `decrement_lcol` | Remove one window from the left column |
 | `resize grow\|shrink` | Grow/shrink the left column by 50px. Always targets the left column so the divider moves consistently regardless of focus. |
 | `fullscreen` | Toggle zoom: float window to fill workspace rect without real fullscreen. Press again to restore tiling position. |
-| `real_fullscreen` | Toggle sway's native fullscreen |
