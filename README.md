@@ -1,8 +1,12 @@
 # swaymonad
 
-An xmonad-like auto-tiler for sway. Implements a "tall" layout: primary column on the left, secondary column on the right.
+An xmonad-like auto-tiler for sway. Implements a "tall" layout: primary column
+on the left, secondary column on the right. Effectively a simplified rewrite of
+[swaymonad](https://github.com/nicolasavru/swaymonad) with reduced amounts of
+code, features, and bugs.
 
 Requires [i3ipc-python](https://github.com/altdesktop/i3ipc-python).
+
 
 ## Usage
 
@@ -21,8 +25,6 @@ exec python3 /path/to/swaymonad.py
 All commands are sent via sway's `nop` command. Add these bindings to `~/.config/sway/config`:
 
 ```
-set $mod Mod4
-
 # Focus next/prev window in tiling order
 bindsym $mod+j nop focus_next_window
 bindsym $mod+k nop focus_prev_window
@@ -39,15 +41,19 @@ bindsym $mod+comma nop flow_left
 bindsym $mod+period nop flow_right
 
 # Resize the column divider (always moves the divider between columns)
-bindsym $mod+h nop resize shrink
-bindsym $mod+l nop resize grow
+bindsym $mod+h nop move_divider left
+bindsym $mod+l nop move_divider right
 
 # Zoom: float window to fill workspace without triggering real fullscreen
 # (swaybar stays visible, Chrome keeps tabs, etc.)
 bindsym $mod+f nop fullscreen
 
+# Optional but recommended sway bindings
 # Real sway fullscreen (bypass swaymonad, use sway directly)
 bindsym $mod+Shift+f fullscreen
+# Resize individual container vertically
+bindsym $mod+a resize grow height 20px
+bindsym $mod+z resize shrink height 20px
 ```
 
 ## Commands
@@ -61,5 +67,5 @@ bindsym $mod+Shift+f fullscreen
 | `promote_window` | Swap focused window with the largest window |
 | `flow_left` | Move one window from the right -> left column |
 | `flow_right` | Move one window from the left -> right column |
-| `resize grow\|shrink [amount]` | Grow/shrink the left column. Always targets the left column so the divider moves consistently regardless of focus. Amount defaults to `50px`. |
+| `move_divider left\|right [amount]` | Move the column divider left or right. Always targets the left column so the divider moves consistently regardless of focus. Amount defaults to `50px`. |
 | `fullscreen` | Toggle zoom: float window to fill workspace rect without real fullscreen. Press again to restore tiling position. |

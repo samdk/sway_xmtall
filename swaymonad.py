@@ -482,15 +482,15 @@ def cmd_flow_right(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
     focused.command("focus")
   state.snapshot = refetch(i3, ws)
 
-def cmd_resize(i3: i3ipc.Connection, event: i3ipc.Event, direction: str, amount: str = "50px", *args) -> None:
+def cmd_move_divider(i3: i3ipc.Connection, event: i3ipc.Event, direction: str, amount: str = "50px", *args) -> None:
   ws = get_focused_workspace(i3)
   if not ws or len(ws.nodes) < 2:
     return
   state = get_state(i3, ws)
   lcol = ws.nodes[0]
-  if direction == "grow":
+  if direction == "right":
     lcol.command(f"resize grow width {amount}")
-  elif direction == "shrink":
+  elif direction == "left":
     lcol.command(f"resize shrink width {amount}")
   ws = refetch(i3, ws)
   if ws and len(ws.nodes) >= 2:
@@ -564,7 +564,7 @@ COMMANDS = {
   "flow_left": cmd_flow_left,
   "flow_right": cmd_flow_right,
   "fullscreen": cmd_zoom,
-  "resize": cmd_resize,
+  "move_divider": cmd_move_divider,
 }
 
 
