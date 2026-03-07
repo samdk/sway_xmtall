@@ -12,36 +12,78 @@ from typing import Optional
 import i3ipc
 
 
-# -- Per-workspace state ------------------------------------------------------
+# -- State --------------------------------------------------------------------
 
-class WorkspaceState:
-  def __init__(self, workspace_id: int, n_lcol: int = 1):
-    self.workspace_id = workspace_id
+class Layout:
+  """Intended workspace layout. Only modified by user actions and initialization."""
+
+  def __init__(self, n_lcol: int = 1):
     self.n_lcol = n_lcol
-    self.pending_moves = 0
-    self.snapshot: Optional[i3ipc.Con] = None
-    self.last_rcol_width: Optional[int] = None
+    self.rcol_width: Optional[int] = None
     self.zoomed_id: Optional[int] = None
     self.zoom_neighbor_id: Optional[int] = None
 
+  def clear_zoom(self) -> None:
+    self.zoomed_id = None
+    self.zoom_neighbor_id = None
+
+
+class WorkspaceState:
+  """Per-workspace state: layout intent + change detection."""
+
+  def __init__(self, workspace_id: int, layout: Optional[Layout] = None):
+    self.workspace_id = workspace_id
+    self.layout = layout or Layout()
+    self.snapshot: Optional[i3ipc.Con] = None
+    self.pending_moves = 0
+
   def __repr__(self) -> str:
-    return f"WorkspaceState({self.workspace_id}, n_lcol={self.n_lcol})"
+    return f"WorkspaceState({self.workspace_id}, n_lcol={self.layout.n_lcol})"
 
 
-WORKSPACES: dict[int, WorkspaceState] = {}
+class State:
+  """Manages per-workspace layout state."""
+
+  def __init__(self) -> None:
+    self._workspaces: dict[int, WorkspaceState] = {}
+
+  def get(self, workspace: i3ipc.Con) -> WorkspaceState:
+    """Get or create state for a workspace, inferring layout from tree."""
+    if workspace.id not in self._workspaces:
+      layout = Layout()
+      if workspace.nodes and workspace.nodes[0].nodes:
+        layout.n_lcol = len(workspace.nodes[0].nodes)
+      if len(workspace.nodes) >= 2:
+        layout.rcol_width = workspace.nodes[1].rect.width
+      ws_state = WorkspaceState(workspace.id, layout)
+      self._workspaces[workspace.id] = ws_state
+      logging.debug(f"Created {ws_state} for workspace {workspace.id}.")
+    return self._workspaces[workspace.id]
+
+  def find_workspace_for_window(self, i3: i3ipc.Connection,
+                                window_id: int) -> tuple[Optional[i3ipc.Con], Optional[WorkspaceState]]:
+    """Find which workspace a window belongs to by searching snapshots."""
+    for ws_id, ws_state in self._workspaces.items():
+      if ws_state.snapshot and ws_state.snapshot.find_by_id(window_id):
+        workspace = i3.get_tree().find_by_id(ws_id)
+        return workspace, ws_state
+    return None, None
+
+  def remove(self, workspace_id: int) -> None:
+    self._workspaces.pop(workspace_id, None)
+
+  def initialize(self, i3: i3ipc.Connection) -> None:
+    """Snapshot all existing workspaces (handles script restart)."""
+    tree = i3.get_tree()
+    for reply in i3.get_workspaces():
+      node = tree.find_by_id(reply.ipc_data["id"])
+      if node:
+        ws = node.workspace()
+        if ws and ws.leaves():
+          self.get(ws).snapshot = ws
 
 
-def get_state(i3: i3ipc.Connection, workspace: i3ipc.Con) -> WorkspaceState:
-  if workspace.id not in WORKSPACES:
-    state = WorkspaceState(workspace.id)
-    # Infer n_lcol from existing tree (handles config reload).
-    if workspace.nodes and workspace.nodes[0].nodes:
-      state.n_lcol = len(workspace.nodes[0].nodes)
-    if len(workspace.nodes) >= 2:
-      state.last_rcol_width = workspace.nodes[1].rect.width
-    WORKSPACES[workspace.id] = state
-    logging.debug(f"Created {state} for workspace {workspace.id}.")
-  return WORKSPACES[workspace.id]
+STATE = State()
 
 
 # -- IPC helpers --------------------------------------------------------------
@@ -192,7 +234,7 @@ def reflow_workspace(i3: i3ipc.Connection, state: WorkspaceState,
     return
 
   # All windows fit in one column — merge everything (batched).
-  if state.n_lcol == 0 or len(leaves) <= state.n_lcol:
+  if state.layout.n_lcol == 0 or len(leaves) <= state.layout.n_lcol:
     if len(workspace.nodes) > 1:
       first_col = workspace.nodes[0]
       prev_target = first_col.nodes[-1] if first_col.nodes else first_col
@@ -208,7 +250,7 @@ def reflow_workspace(i3: i3ipc.Connection, state: WorkspaceState,
   # Create second column from single column (requires refetch for new IDs).
   if len(cols) == 1:
     col = cols[0]
-    if len(col.nodes) > state.n_lcol:
+    if len(col.nodes) > state.layout.n_lcol:
       focused = workspace.find_focused()
       command_move(state, col.nodes[-1], "right")
       if focused:
@@ -235,32 +277,28 @@ def reflow_workspace(i3: i3ipc.Connection, state: WorkspaceState,
     return
 
   # Ensure both columns are splitv; restore rcol width if recreating.
-  restored_rcol_width = False
   for i, col in enumerate(cols):
     if col.layout != "splitv":
-      if i == 1 and state.last_rcol_width:
-        col.command(f"splitv, resize set width {state.last_rcol_width} px")
-        restored_rcol_width = True
+      if i == 1 and state.layout.rcol_width:
+        col.command(f"splitv, resize set width {state.layout.rcol_width} px")
       else:
         col.command("splitv")
 
   lcol, rcol = cols[0], cols[1]
-  if not restored_rcol_width:
-    state.last_rcol_width = rcol.rect.width
 
   # Balance columns — batch all moves without intermediate refetches.
-  if len(lcol.nodes) < state.n_lcol and rcol.nodes:
+  if len(lcol.nodes) < state.layout.n_lcol and rcol.nodes:
     # Pull windows from rcol to lcol.
-    needed = min(state.n_lcol - len(lcol.nodes), len(rcol.nodes))
+    needed = min(state.layout.n_lcol - len(lcol.nodes), len(rcol.nodes))
     to_move = list(rcol.nodes[:needed])
     prev_target = lcol.nodes[-1] if lcol.nodes else lcol
     for node in to_move:
       move_to_target(state, node, prev_target)
       prev_target = node
 
-  elif len(lcol.nodes) > state.n_lcol and len(lcol.nodes) > 1:
+  elif len(lcol.nodes) > state.layout.n_lcol and len(lcol.nodes) > 1:
     # Push excess windows from lcol to rcol front.
-    push_to_front(state, rcol, list(lcol.nodes[state.n_lcol:]))
+    push_to_front(state, rcol, list(lcol.nodes[state.layout.n_lcol:]))
 
 
 def check_reflow(state: WorkspaceState, workspace: i3ipc.Con) -> bool:
@@ -274,14 +312,14 @@ def check_reflow(state: WorkspaceState, workspace: i3ipc.Con) -> bool:
     return True
 
   # Should be single column.
-  if state.n_lcol == 0 or n <= state.n_lcol:
+  if state.layout.n_lcol == 0 or n <= state.layout.n_lcol:
     return len(cols) == 1
 
   # Should be two columns with n_lcol in the left.
   if len(cols) != 2:
     return False
   lcol_leaves = tiling_leaves(cols[0])
-  return len(lcol_leaves) == state.n_lcol
+  return len(lcol_leaves) == state.layout.n_lcol
 
 
 def verify_reflow(i3: i3ipc.Connection, state: WorkspaceState,
@@ -327,14 +365,13 @@ def speculative_swap_and_reflow(state: WorkspaceState,
   leaves = tiling_leaves(workspace)
 
   # Only speculate for the stable 2-column case.
-  if state.n_lcol == 0 or len(leaves) <= state.n_lcol:
+  if state.layout.n_lcol == 0 or len(leaves) <= state.layout.n_lcol:
     return False
   cols = workspace.nodes
   if len(cols) != 2:
     return False
 
   lcol, rcol = cols[0], cols[1]
-  state.last_rcol_width = rcol.rect.width
 
   # Only speculate when both nodes are direct children of the same column.
   lcol_node_ids = {n.id for n in lcol.nodes}
@@ -350,8 +387,8 @@ def speculative_swap_and_reflow(state: WorkspaceState,
     idx_target = next(k for k, n in enumerate(nodes) if n.id == target.id)
     nodes[idx_new], nodes[idx_target] = nodes[idx_target], nodes[idx_new]
 
-    if len(nodes) > state.n_lcol:
-      push_to_front(state, rcol, nodes[state.n_lcol:])
+    if len(nodes) > state.layout.n_lcol:
+      push_to_front(state, rcol, nodes[state.layout.n_lcol:])
     return True
 
   if new_window.id in rcol_node_ids and target.id in rcol_node_ids:
@@ -368,7 +405,7 @@ def on_window_new(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
   workspace = get_workspace_of_event(i3, event) or get_focused_workspace(i3)
   if not workspace:
     return
-  state = get_state(i3, workspace)
+  state = STATE.get(workspace)
 
   try:
     i3.enable_command_buffering()
@@ -411,29 +448,21 @@ def on_window_new(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
 def on_window_close(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
   # Find workspace for the closed window by searching snapshots,
   # since the window is already gone from the live tree.
-  workspace = None
-  state = None
-  for ws_id, ws_state in WORKSPACES.items():
-    if ws_state.snapshot and ws_state.snapshot.find_by_id(event.container.id):
-      workspace = i3.get_tree().find_by_id(ws_id)
-      state = ws_state
-      break
-
+  workspace, state = STATE.find_workspace_for_window(i3, event.container.id)
   if not workspace or not state:
     workspace = get_focused_workspace(i3)
     if not workspace:
       return
-    state = get_state(i3, workspace)
+    state = STATE.get(workspace)
 
   try:
     i3.enable_command_buffering()
 
     # Clear zoom state if the zoomed window or its neighbor was closed.
-    if state.zoomed_id is not None and event.container.id == state.zoomed_id:
-      state.zoomed_id = None
-      state.zoom_neighbor_id = None
-    if state.zoom_neighbor_id is not None and event.container.id == state.zoom_neighbor_id:
-      state.zoom_neighbor_id = None
+    if state.layout.zoomed_id is not None and event.container.id == state.layout.zoomed_id:
+      state.layout.clear_zoom()
+    elif state.layout.zoom_neighbor_id is not None and event.container.id == state.layout.zoom_neighbor_id:
+      state.layout.zoom_neighbor_id = None
 
     should_reflow = False
     fullscreen_candidate = None
@@ -477,7 +506,7 @@ def on_window_close(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
 
     # Clean up state for empty workspaces.
     if workspace and not workspace.leaves():
-      WORKSPACES.pop(workspace.id, None)
+      STATE.remove(workspace.id)
     else:
       state.snapshot = workspace
     i3.disable_command_buffering()
@@ -499,7 +528,7 @@ def reflow_old_workspace(i3: i3ipc.Connection, new_workspace: i3ipc.Con) -> None
     i3.command("workspace back_and_forth")
 
   if old_workspace:
-    old_state = get_state(i3, old_workspace)
+    old_state = STATE.get(old_workspace)
     do_reflow(i3, old_state)
     old_state.snapshot = refetch(i3, old_workspace)
 
@@ -508,7 +537,7 @@ def on_window_move(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
   workspace = get_workspace_of_event(i3, event) or get_focused_workspace(i3)
   if not workspace:
     return
-  state = get_state(i3, workspace)
+  state = STATE.get(workspace)
 
   if state.pending_moves > 0:
     logging.debug(f"Suppressing self-triggered move ({state.pending_moves} pending).")
@@ -561,12 +590,12 @@ def adjust_n_lcol(i3: i3ipc.Connection, delta: int) -> None:
   ws = get_focused_workspace(i3)
   if not ws:
     return
-  state = get_state(i3, ws)
+  state = STATE.get(ws)
   focused = ws.find_focused()
   n_leaves = len(tiling_leaves(ws))
-  effective = max(0, min(state.n_lcol, n_leaves))
-  state.n_lcol = max(0, min(effective + delta, n_leaves))
-  logging.debug(f"adjust_n_lcol: n_lcol={state.n_lcol}")
+  effective = max(0, min(state.layout.n_lcol, n_leaves))
+  state.layout.n_lcol = max(0, min(effective + delta, n_leaves))
+  logging.debug(f"adjust_n_lcol: n_lcol={state.layout.n_lcol}")
   do_reflow(i3, state, ws)
   if focused:
     focused.command("focus")
@@ -582,7 +611,7 @@ def cmd_move_divider(i3: i3ipc.Connection, event: i3ipc.Event, direction: str, a
   ws = get_focused_workspace(i3)
   if not ws or len(ws.nodes) < 2:
     return
-  state = get_state(i3, ws)
+  state = STATE.get(ws)
   lcol = ws.nodes[0]
   if direction == "right":
     lcol.command(f"resize grow width {amount}")
@@ -590,52 +619,51 @@ def cmd_move_divider(i3: i3ipc.Connection, event: i3ipc.Event, direction: str, a
     lcol.command(f"resize shrink width {amount}")
   ws = refetch(i3, ws)
   if ws and len(ws.nodes) >= 2:
-    state.last_rcol_width = ws.nodes[1].rect.width
+    state.layout.rcol_width = ws.nodes[1].rect.width
 
 def cmd_zoom(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   ws = get_focused_workspace(i3)
   if not ws:
     return
-  state = get_state(i3, ws)
+  state = STATE.get(ws)
   focused = ws.find_focused()
   if not focused:
     return
 
   # Toggle off: unzoom
-  if state.zoomed_id is not None:
-    zoomed = i3.get_tree().find_by_id(state.zoomed_id)
+  if state.layout.zoomed_id is not None:
+    zoomed = i3.get_tree().find_by_id(state.layout.zoomed_id)
     if zoomed:
       zoomed.command("floating disable, border pixel 2")
       do_reflow(i3, state)
       # Restore position next to saved neighbor
-      if state.zoom_neighbor_id is not None:
+      if state.layout.zoom_neighbor_id is not None:
         ws = refetch(i3, ws)
         if ws:
           leaf_ids = [l.id for l in tiling_leaves(ws)]
           zoomed = refetch(i3, zoomed)
-          if zoomed and state.zoom_neighbor_id in leaf_ids:
-            neighbor = i3.get_tree().find_by_id(state.zoom_neighbor_id)
+          if zoomed and state.layout.zoom_neighbor_id in leaf_ids:
+            neighbor = i3.get_tree().find_by_id(state.layout.zoom_neighbor_id)
             if neighbor:
               move_before(state, zoomed, neighbor)
               do_reflow(i3, state)
       zoomed = refetch(i3, zoomed)
       if zoomed:
         zoomed.command("focus")
-    state.zoomed_id = None
-    state.zoom_neighbor_id = None
+    state.layout.clear_zoom()
     state.snapshot = refetch(i3, ws)
     return
 
   # Toggle on: zoom
-  state.zoomed_id = focused.id
+  state.layout.zoomed_id = focused.id
   # Find next window in tiling order for position restore (without wrapping)
   leaves = ws.leaves()
   leaf_ids = [l.id for l in leaves]
   try:
     idx = leaf_ids.index(focused.id)
-    state.zoom_neighbor_id = leaf_ids[idx + 1] if idx + 1 < len(leaf_ids) else None
+    state.layout.zoom_neighbor_id = leaf_ids[idx + 1] if idx + 1 < len(leaf_ids) else None
   except ValueError:
-    state.zoom_neighbor_id = None
+    state.layout.zoom_neighbor_id = None
   # Float and fill workspace rect
   r = ws.rect
   focused.command(
@@ -746,15 +774,7 @@ if __name__ == "__main__":
 
   i3 = Connection(delay=cmd_args.delay)
 
-  # Initialize state for existing workspaces so snapshots are valid
-  # from the first event (handles script restart / exec_always).
-  tree = i3.get_tree()
-  for reply in i3.get_workspaces():
-    node = tree.find_by_id(reply.ipc_data["id"])
-    if node:
-      ws = node.workspace()
-      if ws and ws.leaves():
-        get_state(i3, ws).snapshot = ws
+  STATE.initialize(i3)
 
   i3.on(i3ipc.Event.BINDING, on_binding)
   i3.on(i3ipc.Event.WINDOW_NEW, on_window_new)
