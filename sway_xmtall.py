@@ -168,99 +168,223 @@ def promote_window(i3: i3ipc.Connection) -> None:
 
 # -- Tall layout reflow -------------------------------------------------------
 
-def ensure_two_columns(i3: i3ipc.Connection, state: WorkspaceState,
-                       workspace: i3ipc.Con) -> i3ipc.Con:
-  """Ensure workspace has exactly 2 top-level splitv containers."""
-  # Merge extra columns into column 1.
-  while len(workspace.nodes) > 2:
-    extra = workspace.nodes[-1]
-    target = workspace.nodes[1]
-    for node in list(extra.nodes):
-      move_to_target(state, node, target)
-    workspace = refetch(i3, workspace)
+def reflow_workspace(i3: i3ipc.Connection, state: WorkspaceState,
+                     workspace: i3ipc.Con) -> None:
+  """Full reflow of workspace layout with minimal IPC round-trips.
+  Computes all needed moves from the current tree snapshot and batches them,
+  avoiding the per-move refetch cycle."""
+  leaves = [l for l in workspace.leaves() if not is_floating(l)]
 
-  # Split single column if we have more than n_lcol windows.
-  if len(workspace.nodes) == 1:
-    col = workspace.nodes[0]
+  if len(leaves) <= 1:
+    return
+
+  # All windows fit in one column — merge everything (batched).
+  if state.n_lcol == 0 or len(leaves) <= state.n_lcol:
+    if len(workspace.nodes) > 1:
+      first_col = workspace.nodes[0]
+      prev_target = first_col.nodes[-1] if first_col.nodes else first_col
+      for col in workspace.nodes[1:]:
+        for node in list(col.nodes):
+          move_to_target(state, node, prev_target)
+          prev_target = node
+    return
+
+  # Need two columns.
+  cols = workspace.nodes
+
+  # Create second column from single column (requires refetch for new IDs).
+  if len(cols) == 1:
+    col = cols[0]
     if len(col.nodes) > state.n_lcol:
       focused = workspace.find_focused()
       command_move(state, col.nodes[-1], "right")
       if focused:
         focused.command("focus")
       workspace = refetch(i3, workspace)
+      if not workspace:
+        return
+      cols = workspace.nodes
+
+  # Merge extra columns (>2) into column 1 (batched, one refetch after).
+  if len(cols) > 2:
+    target_col = cols[1]
+    prev_target = target_col.nodes[-1] if target_col.nodes else target_col
+    for col in list(cols[2:]):
+      for node in list(col.nodes):
+        move_to_target(state, node, prev_target)
+        prev_target = node
+    workspace = refetch(i3, workspace)
+    if not workspace:
+      return
+    cols = workspace.nodes
+
+  if len(cols) != 2:
+    return
 
   # Ensure both columns are splitv; restore rcol width if recreating.
-  for i, col in enumerate(workspace.nodes):
+  for i, col in enumerate(cols):
     if col.layout != "splitv":
       if i == 1 and state.last_rcol_width:
         col.command(f"splitv, resize set width {state.last_rcol_width} px")
       else:
         col.command("splitv")
 
-  return refetch(i3, workspace)
+  lcol, rcol = cols[0], cols[1]
+  state.last_rcol_width = rcol.rect.width
+
+  # Balance columns — batch all moves without intermediate refetches.
+  if len(lcol.nodes) < state.n_lcol and rcol.nodes:
+    # Pull windows from rcol to lcol.
+    needed = min(state.n_lcol - len(lcol.nodes), len(rcol.nodes))
+    to_move = list(rcol.nodes[:needed])
+    prev_target = lcol.nodes[-1] if lcol.nodes else lcol
+    for node in to_move:
+      move_to_target(state, node, prev_target)
+      prev_target = node
+
+  elif len(lcol.nodes) > state.n_lcol and len(lcol.nodes) > 1:
+    # Push excess windows from lcol to rcol front.
+    excess = list(lcol.nodes[state.n_lcol:])
+    if rcol.nodes:
+      # Insert before first rcol node, in reverse order to preserve ordering.
+      move_before(state, excess[-1], rcol.nodes[0])
+      for i in range(len(excess) - 2, -1, -1):
+        move_before(state, excess[i], excess[i + 1])
+    else:
+      # rcol is empty — move first excess in, rest after it.
+      move_to_target(state, excess[0], rcol)
+      for i in range(1, len(excess)):
+        move_to_target(state, excess[i], excess[i - 1])
 
 
-def ensure_single_column(i3: i3ipc.Connection, state: WorkspaceState,
-                         workspace: i3ipc.Con) -> i3ipc.Con:
-  """Merge all columns into one."""
-  while len(workspace.nodes) > 1:
-    last = workspace.nodes[-1]
-    target = workspace.nodes[0]
-    for node in list(last.nodes):
-      move_to_target(state, node, target)
-    workspace = refetch(i3, workspace)
-  return workspace
-
-
-def reflow(i3: i3ipc.Connection, state: WorkspaceState,
-           workspace: i3ipc.Con) -> bool:
-  """One pass of structural correction. Returns True if a mutation occurred."""
+def check_reflow(state: WorkspaceState, workspace: i3ipc.Con) -> bool:
+  """Check whether the workspace layout matches the intended structure.
+  Returns True if the layout is correct."""
   leaves = [l for l in workspace.leaves() if not is_floating(l)]
-
-  if len(leaves) <= 1:
-    return False
-
-  if state.n_lcol == 0 or len(leaves) <= state.n_lcol:
-    if len(workspace.nodes) > 1:
-      ensure_single_column(i3, state, workspace)
-      return True
-    return False
-
-  # Need 2 columns.
-  workspace = ensure_two_columns(i3, state, workspace)
+  n = len(leaves)
   cols = workspace.nodes
 
+  if n <= 1:
+    return True
+
+  # Should be single column.
+  if state.n_lcol == 0 or n <= state.n_lcol:
+    return len(cols) == 1
+
+  # Should be two columns with n_lcol in the left.
+  if len(cols) != 2:
+    return False
+  lcol_leaves = [l for l in cols[0].leaves() if not is_floating(l)]
+  return len(lcol_leaves) == state.n_lcol
+
+
+def correct_reflow(i3: i3ipc.Connection, state: WorkspaceState,
+                   workspace: i3ipc.Con) -> None:
+  """Single corrective move. Handles one structural issue per call."""
+  leaves = [l for l in workspace.leaves() if not is_floating(l)]
+  if len(leaves) <= 1:
+    return
+  cols = workspace.nodes
+
+  if state.n_lcol == 0 or len(leaves) <= state.n_lcol:
+    if len(cols) > 1:
+      for node in list(cols[-1].nodes):
+        move_to_target(state, node, cols[0])
+    return
+
+  if len(cols) > 2:
+    for node in list(cols[-1].nodes):
+      move_to_target(state, node, cols[1])
+    return
+
+  if len(cols) == 1:
+    col = cols[0]
+    if len(col.nodes) > state.n_lcol:
+      command_move(state, col.nodes[-1], "right")
+    return
+
+  if len(cols) == 2:
+    lcol, rcol = cols[0], cols[1]
+    lcol_leaves = [l for l in lcol.leaves() if not is_floating(l)]
+    if len(lcol_leaves) < state.n_lcol and rcol.nodes:
+      move_to_target(state, rcol.nodes[0], lcol)
+    elif len(lcol_leaves) > state.n_lcol and len(lcol.nodes) > 1:
+      add_to_front(state, rcol, lcol.nodes[-1])
+
+
+def do_reflow(i3: i3ipc.Connection, state: WorkspaceState,
+              workspace: Optional[i3ipc.Con] = None) -> None:
+  """Reflow workspace layout. Callers should verify with check_reflow after
+  flushing commands (e.g. via refetch) if they need to confirm the result."""
+  if workspace is None:
+    workspace = i3.get_tree().find_by_id(state.workspace_id)
+  if not workspace:
+    return
+  reflow_workspace(i3, state, workspace)
+
+
+# -- Event handlers -----------------------------------------------------------
+
+def speculative_swap_and_reflow(state: WorkspaceState,
+                                workspace: i3ipc.Con, new_id: int) -> bool:
+  """Compute swap+reflow from workspace snapshot without extra IPC.
+  Predicts post-swap column order to batch swap+reflow together.
+  Returns True if speculative commands were issued, False to fall back."""
+  new_window = workspace.find_by_id(new_id)
+  if not new_window or is_floating(new_window):
+    return False
+
+  target = find_offset_window(new_window, -1)
+  if not target or target.id == new_window.id:
+    return False
+
+  leaves = [l for l in workspace.leaves() if not is_floating(l)]
+
+  # Only speculate for the stable 2-column case.
+  if state.n_lcol == 0 or len(leaves) <= state.n_lcol:
+    return False
+  cols = workspace.nodes
   if len(cols) != 2:
     return False
 
   lcol, rcol = cols[0], cols[1]
 
-  # Save rcol width.
+  # Issue the swap.
+  new_window.command(f"swap container with con_id {target.id}")
+  new_window.command("focus")
+
   state.last_rcol_width = rcol.rect.width
 
-  # Balance: move windows between columns.
-  if len(lcol.nodes) < state.n_lcol and rcol.nodes:
-    move_to_target(state, rcol.nodes[0], lcol)
+  # Only speculate when both nodes are direct children of the same column.
+  lcol_node_ids = {n.id for n in lcol.nodes}
+  rcol_node_ids = {n.id for n in rcol.nodes}
+
+  if new_window.id in lcol_node_ids and target.id in lcol_node_ids:
+    # Same-column swap in lcol. Simulate post-swap node order.
+    nodes = list(lcol.nodes)
+    idx_new = next(k for k, n in enumerate(nodes) if n.id == new_window.id)
+    idx_target = next(k for k, n in enumerate(nodes) if n.id == target.id)
+    nodes[idx_new], nodes[idx_target] = nodes[idx_target], nodes[idx_new]
+
+    if len(nodes) > state.n_lcol:
+      excess = nodes[state.n_lcol:]
+      if rcol.nodes:
+        move_before(state, excess[-1], rcol.nodes[0])
+        for i in range(len(excess) - 2, -1, -1):
+          move_before(state, excess[i], excess[i + 1])
+      else:
+        move_to_target(state, excess[0], rcol)
+        for i in range(1, len(excess)):
+          move_to_target(state, excess[i], excess[i - 1])
     return True
 
-  if len(lcol.nodes) > state.n_lcol and len(lcol.nodes) > 1:
-    add_to_front(state, rcol, lcol.nodes[-1])
+  if new_window.id in rcol_node_ids and target.id in rcol_node_ids:
+    # Same-column swap in rcol. Lcol count unchanged, no reflow needed.
     return True
 
+  # Cross-column swap or unexpected structure: fall back.
   return False
 
-
-def do_reflow(i3: i3ipc.Connection, state: WorkspaceState) -> None:
-  """Run reflow until the layout is correct."""
-  for _ in range(20):  # safety bound
-    workspace = i3.get_tree().find_by_id(state.workspace_id)
-    if not workspace:
-      return
-    if not reflow(i3, state, workspace):
-      break
-
-
-# -- Event handlers -----------------------------------------------------------
 
 def on_window_new(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
   workspace = get_workspace_of_event(i3, event) or get_focused_workspace(i3)
@@ -271,9 +395,6 @@ def on_window_new(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
   try:
     i3.enable_command_buffering()
 
-    # Re-fetch to handle the dialog/floating race: sway creates dialogs as
-    # tiling then immediately floats them.
-    workspace = refetch(i3, workspace)
     old_leaf_ids = {l.id for l in state.snapshot.leaves()} if state.snapshot else set()
     leaf_ids = {l.id for l in workspace.leaves()}
 
@@ -281,10 +402,14 @@ def on_window_new(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
     post_hooks = []
 
     if old_leaf_ids != leaf_ids:
-      # Swap new window with prev so it takes the "current" position.
-      new_window = workspace.find_by_id(event.container.id)
-      if new_window:
-        swap_with_offset(i3, -1, window=new_window)
+      # Try speculative path: compute swap+reflow from snapshot, batch together.
+      if not speculative_swap_and_reflow(state, workspace, event.container.id):
+        # Fallback: swap, flush to see post-swap state, then plan reflow.
+        new_window = workspace.find_by_id(event.container.id)
+        if new_window:
+          swap_with_offset(i3, -1, window=new_window)
+        workspace = refetch(i3, workspace)
+        do_reflow(i3, state, workspace)
       should_reflow = True
 
     # Handle fullscreen new windows.
@@ -294,18 +419,20 @@ def on_window_new(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
       post_hooks.append(lambda: con.command("fullscreen"))
 
     if should_reflow:
-      do_reflow(i3, state)
-
+      # Flush all commands, verify, refocus.
       workspace = refetch(i3, workspace)
-      if (workspace and
-          workspace.id == get_focused_workspace(i3).id and
-          (focused := workspace.find_focused())):
+      if workspace and not check_reflow(state, workspace):
+        logging.debug("Post-reflow check failed, correcting.")
+        correct_reflow(i3, state, workspace)
+        workspace = refetch(i3, workspace)
+
+      if workspace and (focused := workspace.find_focused()):
         refocus_window(i3, focused)
 
     for hook in post_hooks:
       hook()
 
-    state.snapshot = refetch(i3, workspace) if workspace else None
+    state.snapshot = workspace
     i3.disable_command_buffering()
   except Exception:
     traceback.print_exc()
@@ -332,44 +459,47 @@ def on_window_close(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
     should_reflow = False
     post_hooks = []
 
-    old_leaf_ids = {l.id for l in state.snapshot.leaves()} if state.snapshot else set()
     leaf_ids = {l.id for l in workspace.leaves()}
-
     closed = state.snapshot.find_by_id(event.container.id) if state.snapshot else None
 
-    if (old_leaf_ids != leaf_ids and
-        workspace.id == get_focused_workspace(i3).id and
-        closed and not is_floating(closed)):
+    if state.snapshot is None:
+      # No snapshot (e.g., after script restart). Reflow to ensure correct structure.
       should_reflow = True
+    elif closed and not is_floating(closed):
+      old_leaf_ids = {l.id for l in state.snapshot.leaves()}
+      if old_leaf_ids != leaf_ids:
+        should_reflow = True
 
-      # Focus the "next" window instead of sway's default.
-      was_fullscreen = closed.fullscreen_mode == 1
-      old_leaves = state.snapshot.leaves()
-      old_ids = [l.id for l in old_leaves]
-      if closed.id in old_ids:
-        idx = old_ids.index(closed.id)
-        for offset in range(1, len(old_ids) + 1):
-          candidate = old_leaves[(idx + offset) % len(old_ids)]
-          if candidate.id in leaf_ids:
-            candidate.command("focus")
-            if was_fullscreen:
-              post_hooks.append(lambda: candidate.command("fullscreen"))
-            break
+        # Focus the "next" window instead of sway's default.
+        was_fullscreen = closed.fullscreen_mode == 1
+        old_leaves = state.snapshot.leaves()
+        old_ids = [l.id for l in old_leaves]
+        if closed.id in old_ids:
+          idx = old_ids.index(closed.id)
+          for offset in range(1, len(old_ids) + 1):
+            candidate = old_leaves[(idx + offset) % len(old_ids)]
+            if candidate.id in leaf_ids:
+              candidate.command("focus")
+              if was_fullscreen:
+                post_hooks.append(lambda: candidate.command("fullscreen"))
+              break
 
     if should_reflow:
-      do_reflow(i3, state)
+      do_reflow(i3, state, workspace)
 
       workspace = refetch(i3, workspace)
-      if (workspace and
-          workspace.id == get_focused_workspace(i3).id and
-          (focused := workspace.find_focused())):
+      if workspace and not check_reflow(state, workspace):
+        logging.debug("Post-reflow check failed, correcting.")
+        correct_reflow(i3, state, workspace)
+        workspace = refetch(i3, workspace)
+
+      if workspace and (focused := workspace.find_focused()):
         refocus_window(i3, focused)
 
     for hook in post_hooks:
       hook()
 
     # Clean up state for empty workspaces.
-    workspace = refetch(i3, workspace)
     if workspace and not workspace.leaves():
       WORKSPACES.pop(workspace.id, None)
     else:
@@ -454,12 +584,12 @@ def adjust_n_lcol(i3: i3ipc.Connection, delta: int) -> None:
   if not ws:
     return
   state = get_state(i3, ws)
-  focused = get_focused_window(i3)
+  focused = ws.find_focused()
   n_leaves = len([l for l in ws.leaves() if not is_floating(l)])
   effective = max(0, min(state.n_lcol, n_leaves))
   state.n_lcol = max(0, min(effective + delta, n_leaves))
   logging.debug(f"adjust_n_lcol: n_lcol={state.n_lcol}")
-  do_reflow(i3, state)
+  do_reflow(i3, state, ws)
   if focused:
     focused.command("focus")
   state.snapshot = refetch(i3, ws)
@@ -631,6 +761,16 @@ if __name__ == "__main__":
     format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
 
   i3 = Connection()
+
+  # Initialize state for existing workspaces so snapshots are valid
+  # from the first event (handles script restart / exec_always).
+  tree = i3.get_tree()
+  for reply in i3.get_workspaces():
+    node = tree.find_by_id(reply.ipc_data["id"])
+    if node:
+      ws = node.workspace()
+      if ws and ws.leaves():
+        get_state(i3, ws).snapshot = ws
 
   i3.on(i3ipc.Event.BINDING, on_binding)
   i3.on(i3ipc.Event.WINDOW_NEW, on_window_new)
