@@ -71,6 +71,10 @@ def is_floating(container: i3ipc.Con) -> bool:
   return container.floating in ['user_on', 'auto_on'] or container.type == "floating_con"
 
 
+def tiling_leaves(container: i3ipc.Con) -> list[i3ipc.Con]:
+  return [l for l in container.leaves() if not is_floating(l)]
+
+
 # -- Move helpers -------------------------------------------------------------
 
 MARK = "__sway_xmtall_mark"
@@ -91,12 +95,19 @@ def move_before(state: WorkspaceState, node: i3ipc.Con, target: i3ipc.Con) -> No
   move_to_target(state, node, target)
   command_move(state, node, "up")
 
-def add_to_front(state: WorkspaceState, column: i3ipc.Con, node: i3ipc.Con) -> None:
-  """Move node to the front (top) of column."""
-  if not column.nodes:
-    move_to_target(state, node, column)
+def push_to_front(state: WorkspaceState, column: i3ipc.Con,
+                  nodes: list[i3ipc.Con]) -> None:
+  """Move nodes to the front (top) of column, preserving their order."""
+  if not nodes:
     return
-  move_before(state, node, column.nodes[0])
+  if column.nodes:
+    move_before(state, nodes[-1], column.nodes[0])
+    for i in range(len(nodes) - 2, -1, -1):
+      move_before(state, nodes[i], nodes[i + 1])
+  else:
+    move_to_target(state, nodes[0], column)
+    for i in range(1, len(nodes)):
+      move_to_target(state, nodes[i], nodes[i - 1])
 
 
 # -- Window operations --------------------------------------------------------
@@ -154,8 +165,10 @@ def swap_with_offset(i3: i3ipc.Connection, offset: int,
 
 def promote_window(i3: i3ipc.Connection) -> None:
   ws = get_focused_workspace(i3)
-  focused = get_focused_window(i3)
-  if not ws or not focused:
+  if not ws:
+    return
+  focused = ws.find_focused()
+  if not focused:
     return
   largest = max(ws.leaves(), key=lambda l: l.rect.width * l.rect.height, default=None)
   if not largest:
@@ -173,7 +186,7 @@ def reflow_workspace(i3: i3ipc.Connection, state: WorkspaceState,
   """Full reflow of workspace layout with minimal IPC round-trips.
   Computes all needed moves from the current tree snapshot and batches them,
   avoiding the per-move refetch cycle."""
-  leaves = [l for l in workspace.leaves() if not is_floating(l)]
+  leaves = tiling_leaves(workspace)
 
   if len(leaves) <= 1:
     return
@@ -222,15 +235,18 @@ def reflow_workspace(i3: i3ipc.Connection, state: WorkspaceState,
     return
 
   # Ensure both columns are splitv; restore rcol width if recreating.
+  restored_rcol_width = False
   for i, col in enumerate(cols):
     if col.layout != "splitv":
       if i == 1 and state.last_rcol_width:
         col.command(f"splitv, resize set width {state.last_rcol_width} px")
+        restored_rcol_width = True
       else:
         col.command("splitv")
 
   lcol, rcol = cols[0], cols[1]
-  state.last_rcol_width = rcol.rect.width
+  if not restored_rcol_width:
+    state.last_rcol_width = rcol.rect.width
 
   # Balance columns — batch all moves without intermediate refetches.
   if len(lcol.nodes) < state.n_lcol and rcol.nodes:
@@ -244,23 +260,13 @@ def reflow_workspace(i3: i3ipc.Connection, state: WorkspaceState,
 
   elif len(lcol.nodes) > state.n_lcol and len(lcol.nodes) > 1:
     # Push excess windows from lcol to rcol front.
-    excess = list(lcol.nodes[state.n_lcol:])
-    if rcol.nodes:
-      # Insert before first rcol node, in reverse order to preserve ordering.
-      move_before(state, excess[-1], rcol.nodes[0])
-      for i in range(len(excess) - 2, -1, -1):
-        move_before(state, excess[i], excess[i + 1])
-    else:
-      # rcol is empty — move first excess in, rest after it.
-      move_to_target(state, excess[0], rcol)
-      for i in range(1, len(excess)):
-        move_to_target(state, excess[i], excess[i - 1])
+    push_to_front(state, rcol, list(lcol.nodes[state.n_lcol:]))
 
 
 def check_reflow(state: WorkspaceState, workspace: i3ipc.Con) -> bool:
   """Check whether the workspace layout matches the intended structure.
   Returns True if the layout is correct."""
-  leaves = [l for l in workspace.leaves() if not is_floating(l)]
+  leaves = tiling_leaves(workspace)
   n = len(leaves)
   cols = workspace.nodes
 
@@ -274,42 +280,22 @@ def check_reflow(state: WorkspaceState, workspace: i3ipc.Con) -> bool:
   # Should be two columns with n_lcol in the left.
   if len(cols) != 2:
     return False
-  lcol_leaves = [l for l in cols[0].leaves() if not is_floating(l)]
+  lcol_leaves = tiling_leaves(cols[0])
   return len(lcol_leaves) == state.n_lcol
 
 
-def correct_reflow(i3: i3ipc.Connection, state: WorkspaceState,
-                   workspace: i3ipc.Con) -> None:
-  """Single corrective move. Handles one structural issue per call."""
-  leaves = [l for l in workspace.leaves() if not is_floating(l)]
-  if len(leaves) <= 1:
-    return
-  cols = workspace.nodes
-
-  if state.n_lcol == 0 or len(leaves) <= state.n_lcol:
-    if len(cols) > 1:
-      for node in list(cols[-1].nodes):
-        move_to_target(state, node, cols[0])
-    return
-
-  if len(cols) > 2:
-    for node in list(cols[-1].nodes):
-      move_to_target(state, node, cols[1])
-    return
-
-  if len(cols) == 1:
-    col = cols[0]
-    if len(col.nodes) > state.n_lcol:
-      command_move(state, col.nodes[-1], "right")
-    return
-
-  if len(cols) == 2:
-    lcol, rcol = cols[0], cols[1]
-    lcol_leaves = [l for l in lcol.leaves() if not is_floating(l)]
-    if len(lcol_leaves) < state.n_lcol and rcol.nodes:
-      move_to_target(state, rcol.nodes[0], lcol)
-    elif len(lcol_leaves) > state.n_lcol and len(lcol.nodes) > 1:
-      add_to_front(state, rcol, lcol.nodes[-1])
+def verify_reflow(i3: i3ipc.Connection, state: WorkspaceState,
+                  workspace: i3ipc.Con) -> Optional[i3ipc.Con]:
+  """Flush commands, verify layout is correct, fix if needed, refocus.
+  Returns the fresh workspace."""
+  workspace = refetch(i3, workspace)
+  if workspace and not check_reflow(state, workspace):
+    logging.debug("Post-reflow check failed, correcting.")
+    reflow_workspace(i3, state, workspace)
+    workspace = refetch(i3, workspace)
+  if workspace and (focused := workspace.find_focused()):
+    refocus_window(i3, focused)
+  return workspace
 
 
 def do_reflow(i3: i3ipc.Connection, state: WorkspaceState,
@@ -338,7 +324,7 @@ def speculative_swap_and_reflow(state: WorkspaceState,
   if not target or target.id == new_window.id:
     return False
 
-  leaves = [l for l in workspace.leaves() if not is_floating(l)]
+  leaves = tiling_leaves(workspace)
 
   # Only speculate for the stable 2-column case.
   if state.n_lcol == 0 or len(leaves) <= state.n_lcol:
@@ -348,11 +334,6 @@ def speculative_swap_and_reflow(state: WorkspaceState,
     return False
 
   lcol, rcol = cols[0], cols[1]
-
-  # Issue the swap.
-  new_window.command(f"swap container with con_id {target.id}")
-  new_window.command("focus")
-
   state.last_rcol_width = rcol.rect.width
 
   # Only speculate when both nodes are direct children of the same column.
@@ -360,29 +341,26 @@ def speculative_swap_and_reflow(state: WorkspaceState,
   rcol_node_ids = {n.id for n in rcol.nodes}
 
   if new_window.id in lcol_node_ids and target.id in lcol_node_ids:
-    # Same-column swap in lcol. Simulate post-swap node order.
+    # Same-column swap in lcol. Issue swap, then simulate post-swap order.
+    new_window.command(f"swap container with con_id {target.id}")
+    new_window.command("focus")
+
     nodes = list(lcol.nodes)
     idx_new = next(k for k, n in enumerate(nodes) if n.id == new_window.id)
     idx_target = next(k for k, n in enumerate(nodes) if n.id == target.id)
     nodes[idx_new], nodes[idx_target] = nodes[idx_target], nodes[idx_new]
 
     if len(nodes) > state.n_lcol:
-      excess = nodes[state.n_lcol:]
-      if rcol.nodes:
-        move_before(state, excess[-1], rcol.nodes[0])
-        for i in range(len(excess) - 2, -1, -1):
-          move_before(state, excess[i], excess[i + 1])
-      else:
-        move_to_target(state, excess[0], rcol)
-        for i in range(1, len(excess)):
-          move_to_target(state, excess[i], excess[i - 1])
+      push_to_front(state, rcol, nodes[state.n_lcol:])
     return True
 
   if new_window.id in rcol_node_ids and target.id in rcol_node_ids:
-    # Same-column swap in rcol. Lcol count unchanged, no reflow needed.
+    # Same-column swap in rcol. Lcol count unchanged, just swap.
+    new_window.command(f"swap container with con_id {target.id}")
+    new_window.command("focus")
     return True
 
-  # Cross-column swap or unexpected structure: fall back.
+  # Cross-column swap or unexpected structure: fall back (no commands issued).
   return False
 
 
@@ -399,7 +377,7 @@ def on_window_new(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
     leaf_ids = {l.id for l in workspace.leaves()}
 
     should_reflow = False
-    post_hooks = []
+    was_fullscreen = False
 
     if old_leaf_ids != leaf_ids:
       # Try speculative path: compute swap+reflow from snapshot, batch together.
@@ -412,44 +390,45 @@ def on_window_new(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
         do_reflow(i3, state, workspace)
       should_reflow = True
 
-    # Handle fullscreen new windows.
+    # Check fullscreen before verify_reflow refetches.
     con = workspace.find_by_id(event.container.id)
     if con and con.fullscreen_mode == 1:
-      post_hooks.append(lambda: con.command("focus"))
-      post_hooks.append(lambda: con.command("fullscreen"))
+      was_fullscreen = True
 
     if should_reflow:
-      # Flush all commands, verify, refocus.
-      workspace = refetch(i3, workspace)
-      if workspace and not check_reflow(state, workspace):
-        logging.debug("Post-reflow check failed, correcting.")
-        correct_reflow(i3, state, workspace)
-        workspace = refetch(i3, workspace)
+      workspace = verify_reflow(i3, state, workspace)
 
-      if workspace and (focused := workspace.find_focused()):
-        refocus_window(i3, focused)
-
-    for hook in post_hooks:
-      hook()
+    if was_fullscreen:
+      i3.command(f"[con_id={event.container.id}] focus, fullscreen")
 
     state.snapshot = workspace
     i3.disable_command_buffering()
   except Exception:
+    i3.discard_command_buffer()
     traceback.print_exc()
 
 
 def on_window_close(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
-  # The closed window's workspace comes from the snapshot, since the window
-  # is already gone from the live tree.
-  workspace = get_focused_workspace(i3)
-  if not workspace:
-    return
-  state = get_state(i3, workspace)
+  # Find workspace for the closed window by searching snapshots,
+  # since the window is already gone from the live tree.
+  workspace = None
+  state = None
+  for ws_id, ws_state in WORKSPACES.items():
+    if ws_state.snapshot and ws_state.snapshot.find_by_id(event.container.id):
+      workspace = i3.get_tree().find_by_id(ws_id)
+      state = ws_state
+      break
+
+  if not workspace or not state:
+    workspace = get_focused_workspace(i3)
+    if not workspace:
+      return
+    state = get_state(i3, workspace)
 
   try:
     i3.enable_command_buffering()
 
-    # Clear zoom state if the zoomed window or its neighbor was closed
+    # Clear zoom state if the zoomed window or its neighbor was closed.
     if state.zoomed_id is not None and event.container.id == state.zoomed_id:
       state.zoomed_id = None
       state.zoom_neighbor_id = None
@@ -457,47 +436,44 @@ def on_window_close(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
       state.zoom_neighbor_id = None
 
     should_reflow = False
-    post_hooks = []
+    fullscreen_candidate = None
+    is_focused = workspace.find_focused() is not None
 
     leaf_ids = {l.id for l in workspace.leaves()}
     closed = state.snapshot.find_by_id(event.container.id) if state.snapshot else None
 
     if state.snapshot is None:
-      # No snapshot (e.g., after script restart). Reflow to ensure correct structure.
       should_reflow = True
     elif closed and not is_floating(closed):
       old_leaf_ids = {l.id for l in state.snapshot.leaves()}
       if old_leaf_ids != leaf_ids:
         should_reflow = True
 
-        # Focus the "next" window instead of sway's default.
-        was_fullscreen = closed.fullscreen_mode == 1
-        old_leaves = state.snapshot.leaves()
-        old_ids = [l.id for l in old_leaves]
-        if closed.id in old_ids:
-          idx = old_ids.index(closed.id)
-          for offset in range(1, len(old_ids) + 1):
-            candidate = old_leaves[(idx + offset) % len(old_ids)]
-            if candidate.id in leaf_ids:
-              candidate.command("focus")
-              if was_fullscreen:
-                post_hooks.append(lambda: candidate.command("fullscreen"))
-              break
+        # Focus the "next" window instead of sway's default
+        # (only if this workspace has focus).
+        if is_focused:
+          was_fullscreen = closed.fullscreen_mode == 1
+          old_leaves = state.snapshot.leaves()
+          old_ids = [l.id for l in old_leaves]
+          if closed.id in old_ids:
+            idx = old_ids.index(closed.id)
+            for offset in range(1, len(old_ids) + 1):
+              candidate = old_leaves[(idx + offset) % len(old_ids)]
+              if candidate.id in leaf_ids:
+                candidate.command("focus")
+                if was_fullscreen:
+                  fullscreen_candidate = candidate
+                break
 
     if should_reflow:
       do_reflow(i3, state, workspace)
-
-      workspace = refetch(i3, workspace)
-      if workspace and not check_reflow(state, workspace):
-        logging.debug("Post-reflow check failed, correcting.")
-        correct_reflow(i3, state, workspace)
+      if is_focused:
+        workspace = verify_reflow(i3, state, workspace)
+      else:
         workspace = refetch(i3, workspace)
 
-      if workspace and (focused := workspace.find_focused()):
-        refocus_window(i3, focused)
-
-    for hook in post_hooks:
-      hook()
+    if fullscreen_candidate:
+      fullscreen_candidate.command("fullscreen")
 
     # Clean up state for empty workspaces.
     if workspace and not workspace.leaves():
@@ -506,7 +482,26 @@ def on_window_close(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
       state.snapshot = workspace
     i3.disable_command_buffering()
   except Exception:
+    i3.discard_command_buffer()
     traceback.print_exc()
+
+
+def reflow_old_workspace(i3: i3ipc.Connection, new_workspace: i3ipc.Con) -> None:
+  """Reflow the workspace a window was moved from."""
+  old_workspace = get_focused_workspace(i3)
+  if not old_workspace:
+    return
+
+  # For cross-output moves, focused workspace may be the same as new.
+  if old_workspace.id == new_workspace.id:
+    i3.command("workspace back_and_forth")
+    old_workspace = get_focused_workspace(i3)
+    i3.command("workspace back_and_forth")
+
+  if old_workspace:
+    old_state = get_state(i3, old_workspace)
+    do_reflow(i3, old_state)
+    old_state.snapshot = refetch(i3, old_workspace)
 
 
 def on_window_move(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
@@ -541,25 +536,8 @@ def on_window_move(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
     state.snapshot = refetch(i3, workspace)
     i3.disable_command_buffering()
   except Exception:
+    i3.discard_command_buffer()
     traceback.print_exc()
-
-
-def reflow_old_workspace(i3: i3ipc.Connection, new_workspace: i3ipc.Con) -> None:
-  """Reflow the workspace a window was moved from."""
-  old_workspace = get_focused_workspace(i3)
-  if not old_workspace:
-    return
-
-  # For cross-output moves, focused workspace may be the same as new.
-  if old_workspace.id == new_workspace.id:
-    i3.command("workspace back_and_forth")
-    old_workspace = get_focused_workspace(i3)
-    i3.command("workspace back_and_forth")
-
-  if old_workspace:
-    old_state = get_state(i3, old_workspace)
-    do_reflow(i3, old_state)
-    old_state.snapshot = refetch(i3, old_workspace)
 
 
 # -- Command handlers ---------------------------------------------------------
@@ -585,7 +563,7 @@ def adjust_n_lcol(i3: i3ipc.Connection, delta: int) -> None:
     return
   state = get_state(i3, ws)
   focused = ws.find_focused()
-  n_leaves = len([l for l in ws.leaves() if not is_floating(l)])
+  n_leaves = len(tiling_leaves(ws))
   effective = max(0, min(state.n_lcol, n_leaves))
   state.n_lcol = max(0, min(effective + delta, n_leaves))
   logging.debug(f"adjust_n_lcol: n_lcol={state.n_lcol}")
@@ -619,7 +597,7 @@ def cmd_zoom(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   if not ws:
     return
   state = get_state(i3, ws)
-  focused = get_focused_window(i3)
+  focused = ws.find_focused()
   if not focused:
     return
 
@@ -633,7 +611,7 @@ def cmd_zoom(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
       if state.zoom_neighbor_id is not None:
         ws = refetch(i3, ws)
         if ws:
-          leaf_ids = [l.id for l in ws.leaves() if not is_floating(l)]
+          leaf_ids = [l.id for l in tiling_leaves(ws)]
           zoomed = refetch(i3, zoomed)
           if zoomed and state.zoom_neighbor_id in leaf_ids:
             neighbor = i3.get_tree().find_by_id(state.zoom_neighbor_id)
@@ -699,6 +677,7 @@ def on_binding(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
     handler(i3, event, *parts[2:])
     i3.disable_command_buffering()
   except Exception:
+    i3.discard_command_buffer()
     traceback.print_exc()
 
 
@@ -706,8 +685,9 @@ def on_binding(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
 
 class Connection(i3ipc.Connection):
 
-  def __init__(self, *args, **kwargs) -> None:
+  def __init__(self, *args, delay: float = 0.0, **kwargs) -> None:
     super().__init__(*args, **kwargs)
+    self.delay = delay
     self.buffering_commands = False
     self.command_buffer: list[str] = []
 
@@ -717,8 +697,8 @@ class Connection(i3ipc.Connection):
       self.command_buffer.append(payload)
       return []
     logging.debug(f"Executing: {payload}")
-    if cmd_args.delay:
-      time.sleep(cmd_args.delay)
+    if self.delay:
+      time.sleep(self.delay)
     return super().command(payload)
 
   def enable_command_buffering(self) -> None:
@@ -731,6 +711,10 @@ class Connection(i3ipc.Connection):
     payload = ";".join(self.command_buffer)
     self.command_buffer = []
     return self.command(payload)
+
+  def discard_command_buffer(self) -> None:
+    self.command_buffer.clear()
+    self.buffering_commands = False
 
   def get_tree(self) -> i3ipc.Con:
     self.disable_command_buffering()
@@ -747,20 +731,20 @@ class Connection(i3ipc.Connection):
 
 # -- Main ---------------------------------------------------------------------
 
-argparser = argparse.ArgumentParser(description='sway-xmtall: an xmonad-like auto-tiler for sway.')
-argparser.add_argument('--verbose', '-v', action='count', help="Enable debug logging.")
-argparser.add_argument('--log-file', help="Log file path (default: stderr).")
-argparser.add_argument('--delay', default=0.0, type=float,
-                       help="Sleep between commands (debug).")
-cmd_args = argparser.parse_args()
-
 if __name__ == "__main__":
+  argparser = argparse.ArgumentParser(description='sway-xmtall: an xmonad-like auto-tiler for sway.')
+  argparser.add_argument('--verbose', '-v', action='count', help="Enable debug logging.")
+  argparser.add_argument('--log-file', help="Log file path (default: stderr).")
+  argparser.add_argument('--delay', default=0.0, type=float,
+                         help="Sleep between commands (debug).")
+  cmd_args = argparser.parse_args()
+
   logging.basicConfig(
     level=logging.DEBUG if cmd_args.verbose else logging.WARNING,
     filename=cmd_args.log_file,
     format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
 
-  i3 = Connection()
+  i3 = Connection(delay=cmd_args.delay)
 
   # Initialize state for existing workspaces so snapshots are valid
   # from the first event (handles script restart / exec_always).
