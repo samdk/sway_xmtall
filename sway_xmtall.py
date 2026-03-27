@@ -641,30 +641,52 @@ def zoom_cycle(i3: i3ipc.Connection, offset: int) -> None:
     return
   ids = [l.id for l in tiling]
 
-  # zoom_neighbor marks where the zoomed window sat in the tiling order;
-  # "next" is the neighbor itself, "prev" is one before it.
-  if state.layout.zoom_neighbor_id in ids:
-    cursor = ids.index(state.layout.zoom_neighbor_id)
+  # Find zoomed window's logical position among all windows.
+  if state.layout.zoom_neighbor_id is not None and state.layout.zoom_neighbor_id in ids:
+    insert_idx = ids.index(state.layout.zoom_neighbor_id)
   else:
-    cursor = 0
-  target_idx = cursor if offset > 0 else (cursor - 1) % len(tiling)
-  target = tiling[target_idx]
-  new_neighbor_id = ids[target_idx + 1] if target_idx + 1 < len(ids) else None
+    insert_idx = len(tiling)
+
+  n = len(tiling) + 1
+  target_logical = (insert_idx + offset) % n
+  if target_logical == insert_idx:
+    return
+
+  # Map logical index to actual tiling window.
+  if target_logical < insert_idx:
+    target = tiling[target_logical]
+  else:
+    target = tiling[target_logical - 1]
+
+  # Compute new zoom_neighbor in the full logical order.
+  next_pos = target_logical + 1
+  if next_pos >= n:
+    new_neighbor_id = None
+  elif next_pos == insert_idx:
+    new_neighbor_id = state.layout.zoomed_id
+  elif next_pos < insert_idx:
+    new_neighbor_id = ids[next_pos]
+  else:
+    new_neighbor_id = ids[next_pos - 1]
 
   old_zoomed_id = state.layout.zoomed_id
   old_neighbor_id = state.layout.zoom_neighbor_id
 
-  # Float target first (covers workspace), then unfloat the zoomed window.
+  # Float target FIRST — it covers the workspace immediately,
+  # hiding all subsequent tiling changes from the user.
   r = ws.rect
   target.command(
     f"floating enable, border none, "
     f"resize set {r.width} px {r.height} px, "
     f"move absolute position {r.x} px {r.y} px"
   )
+
+  # Unfloat old zoomed window (now hidden behind the new zoom).
   zoomed = i3.get_tree().find_by_id(old_zoomed_id)
   if zoomed:
     zoomed.command("floating disable, border pixel 2")
 
+  # Update zoom state.
   state.layout.zoomed_id = target.id
   state.layout.zoom_neighbor_id = new_neighbor_id
 
