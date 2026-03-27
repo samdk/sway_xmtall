@@ -575,10 +575,18 @@ def cmd_promote(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   promote_window(i3)
 
 def cmd_focus_next(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
-  focus_window(i3, 1)
+  ws = get_focused_workspace(i3)
+  if ws and STATE.get(ws).layout.zoomed_id is not None:
+    zoom_cycle(i3, 1)
+  else:
+    focus_window(i3, 1)
 
 def cmd_focus_prev(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
-  focus_window(i3, -1)
+  ws = get_focused_workspace(i3)
+  if ws and STATE.get(ws).layout.zoomed_id is not None:
+    zoom_cycle(i3, -1)
+  else:
+    focus_window(i3, -1)
 
 def cmd_swap_next(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   swap_with_offset(i3, 1)
@@ -620,6 +628,84 @@ def cmd_move_divider(i3: i3ipc.Connection, event: i3ipc.Event, direction: str, a
   ws = refetch(i3, ws)
   if ws and len(ws.nodes) >= 2:
     state.layout.rcol_width = ws.nodes[1].rect.width
+
+def zoom_cycle(i3: i3ipc.Connection, offset: int) -> None:
+  """Cycle to next/prev window while staying in zoom mode."""
+  ws = get_focused_workspace(i3)
+  if not ws:
+    return
+  state = STATE.get(ws)
+
+  tiling = tiling_leaves(ws)
+  if not tiling:
+    return
+  ids = [l.id for l in tiling]
+
+  # Find zoomed window's logical position among all windows.
+  if state.layout.zoom_neighbor_id is not None and state.layout.zoom_neighbor_id in ids:
+    insert_idx = ids.index(state.layout.zoom_neighbor_id)
+  else:
+    insert_idx = len(tiling)
+
+  n = len(tiling) + 1
+  target_logical = (insert_idx + offset) % n
+  if target_logical == insert_idx:
+    return
+
+  # Map logical index to actual tiling window.
+  if target_logical < insert_idx:
+    target = tiling[target_logical]
+  else:
+    target = tiling[target_logical - 1]
+
+  # Compute new zoom_neighbor in the full logical order.
+  next_pos = target_logical + 1
+  if next_pos >= n:
+    new_neighbor_id = None
+  elif next_pos == insert_idx:
+    new_neighbor_id = state.layout.zoomed_id
+  elif next_pos < insert_idx:
+    new_neighbor_id = ids[next_pos]
+  else:
+    new_neighbor_id = ids[next_pos - 1]
+
+  old_zoomed_id = state.layout.zoomed_id
+  old_neighbor_id = state.layout.zoom_neighbor_id
+
+  # Float target FIRST — it covers the workspace immediately,
+  # hiding all subsequent tiling changes from the user.
+  r = ws.rect
+  target.command(
+    f"floating enable, border none, "
+    f"resize set {r.width} px {r.height} px, "
+    f"move absolute position {r.x} px {r.y} px"
+  )
+
+  # Unfloat old zoomed window (now hidden behind the new zoom).
+  zoomed = i3.get_tree().find_by_id(old_zoomed_id)
+  if zoomed:
+    zoomed.command("floating disable, border pixel 2")
+
+  # Update zoom state.
+  state.layout.zoomed_id = target.id
+  state.layout.zoom_neighbor_id = new_neighbor_id
+
+  # Reflow and restore old zoomed window's tiling position.
+  do_reflow(i3, state)
+  if old_neighbor_id is not None:
+    ws = refetch(i3, ws)
+    if ws:
+      old_zoomed = ws.find_by_id(old_zoomed_id)
+      if old_zoomed:
+        leaf_ids = [l.id for l in tiling_leaves(ws)]
+        if old_neighbor_id in leaf_ids:
+          neighbor = ws.find_by_id(old_neighbor_id)
+          if neighbor:
+            move_before(state, old_zoomed, neighbor)
+            do_reflow(i3, state)
+
+  state.snapshot = refetch(i3, ws)
+
 
 def cmd_zoom(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   ws = get_focused_workspace(i3)
@@ -664,7 +750,7 @@ def cmd_zoom(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
     state.layout.zoom_neighbor_id = leaf_ids[idx + 1] if idx + 1 < len(leaf_ids) else None
   except ValueError:
     state.layout.zoom_neighbor_id = None
-  # Float and fill workspace rect
+  # Float and fill workspace rect (oversize to defeat terminal size hints)
   r = ws.rect
   focused.command(
     f"floating enable, border none, "
