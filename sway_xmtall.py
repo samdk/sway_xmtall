@@ -504,6 +504,15 @@ def on_window_close(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
     if fullscreen_candidate:
       fullscreen_candidate.command("fullscreen")
 
+    # Auto-disable zoom when only the zoomed window remains.
+    if state.layout.zoomed_id is not None and workspace:
+      remaining = workspace.leaves()
+      if len(remaining) == 1 and remaining[0].id == state.layout.zoomed_id:
+        remaining[0].command("floating disable, border pixel 2")
+        state.layout.clear_zoom()
+        do_reflow(i3, state, workspace)
+        workspace = refetch(i3, workspace)
+
     # Clean up state for empty workspaces.
     if workspace and not workspace.leaves():
       STATE.remove(workspace.id)
@@ -740,7 +749,9 @@ def cmd_zoom(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
     state.snapshot = refetch(i3, ws)
     return
 
-  # Toggle on: zoom
+  # Toggle on: zoom (skip if only one window)
+  if len(ws.leaves()) <= 1:
+    return
   state.layout.zoomed_id = focused.id
   # Find next window in tiling order for position restore (without wrapping)
   leaves = ws.leaves()
