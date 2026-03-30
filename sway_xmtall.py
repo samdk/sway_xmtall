@@ -4,12 +4,30 @@ Implements a 'tall' layout: primary column on the left,
 secondary column on the right."""
 
 import argparse
+import atexit
 import logging
+import subprocess
 import time
 import traceback
 from typing import Optional
 
 import i3ipc
+
+
+# -- Constants ----------------------------------------------------------------
+
+PLACEHOLDER_APP_ID = "xmtall.placeholder"
+
+# Inline GTK4 script for minimal 1x1 placeholder windows.
+PLACEHOLDER_SCRIPT = (
+  'import gi,sys;gi.require_version("Gtk","4.0");'
+  'from gi.repository import Gtk,GLib;'
+  'GLib.set_prgname(sys.argv[1]);'
+  'a=Gtk.Application(application_id=sys.argv[1]);'
+  'a.connect("activate",lambda a:'
+  'Gtk.ApplicationWindow(application=a,default_width=1,default_height=1).present());'
+  'a.run([])'
+)
 
 
 # -- State --------------------------------------------------------------------
@@ -20,12 +38,6 @@ class Layout:
   def __init__(self, n_lcol: int = 1):
     self.n_lcol = n_lcol
     self.rcol_width: Optional[int] = None
-    self.zoomed_id: Optional[int] = None
-    self.zoom_neighbor_id: Optional[int] = None
-
-  def clear_zoom(self) -> None:
-    self.zoomed_id = None
-    self.zoom_neighbor_id = None
 
 
 class WorkspaceState:
@@ -84,6 +96,102 @@ class State:
 
 
 STATE = State()
+
+
+class ZoomInfo:
+  """Per-workspace zoom tracking."""
+  __slots__ = ('zoomed_id', 'placeholder_con_id', 'source_workspace_name', 'source_workspace_id')
+  def __init__(self, zoomed_id: int, placeholder_con_id: int,
+               ws_name: str, ws_id: int) -> None:
+    self.zoomed_id = zoomed_id
+    self.placeholder_con_id = placeholder_con_id
+    self.source_workspace_name = ws_name
+    self.source_workspace_id = ws_id
+
+
+class ZoomState:
+  """Manages per-workspace zoom with a pool of placeholder windows.
+
+  Placeholders are minimal GTK4 windows parked in the scratchpad. When a
+  workspace is zoomed, a placeholder is taken from the pool and swapped into
+  the tiling slot. Multiple workspaces can be zoomed simultaneously.
+  New placeholders are spawned asynchronously and detected by on_window_new.
+  """
+
+  def __init__(self) -> None:
+    self._zooms: dict[int, ZoomInfo] = {}   # workspace_id → ZoomInfo
+    self._pool: list[int] = []              # available placeholder con_ids
+    self._procs: list[subprocess.Popen] = []
+
+  def is_active_on(self, workspace_id: int) -> bool:
+    return workspace_id in self._zooms
+
+  @property
+  def is_active(self) -> bool:
+    return bool(self._zooms)
+
+  def get_zoom(self, workspace_id: int) -> Optional[ZoomInfo]:
+    return self._zooms.get(workspace_id)
+
+  def is_placeholder(self, con_id: int) -> bool:
+    if con_id in self._pool:
+      return True
+    return any(z.placeholder_con_id == con_id for z in self._zooms.values())
+
+  def take_placeholder(self) -> Optional[int]:
+    return self._pool.pop(0) if self._pool else None
+
+  def return_placeholder(self, con_id: int) -> None:
+    self._pool.append(con_id)
+
+  def start_zoom(self, ws_id: int, zoomed_id: int,
+                 placeholder_con_id: int, ws_name: str) -> None:
+    self._zooms[ws_id] = ZoomInfo(zoomed_id, placeholder_con_id, ws_name, ws_id)
+
+  def end_zoom(self, ws_id: int) -> Optional[ZoomInfo]:
+    return self._zooms.pop(ws_id, None)
+
+  def spawn_one(self) -> None:
+    """Spawn a placeholder process. Detected asynchronously by on_window_new."""
+    proc = subprocess.Popen(
+      ['python3', '-c', PLACEHOLDER_SCRIPT, PLACEHOLDER_APP_ID],
+      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    self._procs.append(proc)
+
+  def ensure_pool(self) -> None:
+    """Spawn a replacement if pool is empty."""
+    if not self._pool:
+      self.spawn_one()
+
+  def spawn_initial(self, i3: i3ipc.Connection) -> bool:
+    """Spawn first placeholder, blocking until ready (before event loop)."""
+    if hasattr(i3, 'disable_command_buffering'):
+      i3.disable_command_buffering()
+    i3.command(f'[app_id="{PLACEHOLDER_APP_ID}"] kill')
+    time.sleep(0.3)
+
+    self.spawn_one()
+    for _ in range(100):  # 10s timeout
+      time.sleep(0.1)
+      if hasattr(i3, 'disable_command_buffering'):
+        i3.disable_command_buffering()
+      tree = i3ipc.Connection.get_tree(i3)
+      for leaf in tree.leaves():
+        if getattr(leaf, 'app_id', None) == PLACEHOLDER_APP_ID:
+          self._pool.append(leaf.id)
+          i3.command(f"[con_id={leaf.id}] move to scratchpad")
+          logging.info(f"Placeholder ready (con_id={leaf.id})")
+          return True
+    logging.error("Failed to spawn initial placeholder")
+    return False
+
+  def kill_all(self) -> None:
+    for proc in self._procs:
+      proc.terminate()
+    self._procs.clear()
+
+
+ZOOM = ZoomState()
 
 
 # -- IPC helpers --------------------------------------------------------------
@@ -402,6 +510,11 @@ def speculative_swap_and_reflow(state: WorkspaceState,
 
 
 def on_window_new(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
+  # Catch new placeholder windows and pool them in the scratchpad.
+  if getattr(event.container, 'app_id', None) == PLACEHOLDER_APP_ID:
+    ZOOM._pool.append(event.container.id)
+    i3ipc.Connection.command(i3, f"[con_id={event.container.id}] move to scratchpad")
+    return
   workspace = get_workspace_of_event(i3, event) or get_focused_workspace(i3)
   if not workspace:
     return
@@ -446,6 +559,39 @@ def on_window_new(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
 
 
 def on_window_close(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
+  cid = event.container.id
+
+  # Handle placeholder death.
+  if getattr(event.container, 'app_id', None) == PLACEHOLDER_APP_ID:
+    if cid in ZOOM._pool:
+      ZOOM._pool.remove(cid)
+    else:
+      # Active placeholder died — unfloat its zoomed window.
+      for ws_id, info in list(ZOOM._zooms.items()):
+        if info.placeholder_con_id == cid:
+          zoomed = i3.get_tree().find_by_id(info.zoomed_id)
+          if zoomed:
+            zoomed.command("floating disable, border pixel 2")
+          ZOOM.end_zoom(ws_id)
+          break
+    ZOOM.ensure_pool()
+    return
+
+  # Handle zoomed window being closed.
+  for ws_id, info in list(ZOOM._zooms.items()):
+    if info.zoomed_id == cid:
+      placeholder = i3.get_tree().find_by_id(info.placeholder_con_id)
+      if placeholder:
+        i3ipc.Connection.command(i3, f"[con_id={placeholder.id}] move to scratchpad")
+        ZOOM.return_placeholder(placeholder.id)
+      source_ws = get_focused_workspace(i3)
+      if source_ws:
+        source_state = STATE.get(source_ws)
+        do_reflow(i3, source_state, source_ws)
+        source_state.snapshot = refetch(i3, source_ws)
+      ZOOM.end_zoom(ws_id)
+      return
+
   # Find workspace for the closed window by searching snapshots,
   # since the window is already gone from the live tree.
   workspace, state = STATE.find_workspace_for_window(i3, event.container.id)
@@ -457,12 +603,6 @@ def on_window_close(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
 
   try:
     i3.enable_command_buffering()
-
-    # Clear zoom state if the zoomed window or its neighbor was closed.
-    if state.layout.zoomed_id is not None and event.container.id == state.layout.zoomed_id:
-      state.layout.clear_zoom()
-    elif state.layout.zoom_neighbor_id is not None and event.container.id == state.layout.zoom_neighbor_id:
-      state.layout.zoom_neighbor_id = None
 
     should_reflow = False
     fullscreen_candidate = None
@@ -488,7 +628,7 @@ def on_window_close(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
             idx = old_ids.index(closed.id)
             for offset in range(1, len(old_ids) + 1):
               candidate = old_leaves[(idx + offset) % len(old_ids)]
-              if candidate.id in leaf_ids:
+              if candidate.id in leaf_ids and not ZOOM.is_placeholder(candidate.id):
                 candidate.command("focus")
                 if was_fullscreen:
                   fullscreen_candidate = candidate
@@ -504,13 +644,20 @@ def on_window_close(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
     if fullscreen_candidate:
       fullscreen_candidate.command("fullscreen")
 
-    # Auto-disable zoom when only the zoomed window remains.
-    if state.layout.zoomed_id is not None and workspace:
-      remaining = workspace.leaves()
-      if len(remaining) == 1 and remaining[0].id == state.layout.zoomed_id:
-        remaining[0].command("floating disable, border pixel 2")
-        state.layout.clear_zoom()
-        do_reflow(i3, state, workspace)
+    # Auto-unzoom when only the placeholder remains on the source workspace.
+    zoom_info = ZOOM.get_zoom(workspace.id) if workspace else None
+    if zoom_info:
+      leaves = tiling_leaves(workspace)
+      if len(leaves) <= 1 and all(ZOOM.is_placeholder(l.id) for l in leaves):
+        zoomed = i3.get_tree().find_by_id(zoom_info.zoomed_id)
+        placeholder = i3.get_tree().find_by_id(zoom_info.placeholder_con_id)
+        if zoomed and placeholder:
+          zoomed.command("floating disable")
+          zoomed.command(
+            f"swap container with con_id {placeholder.id}, border pixel 2")
+          i3.command(f"[con_id={placeholder.id}] move to scratchpad")
+          ZOOM.return_placeholder(placeholder.id)
+        ZOOM.end_zoom(workspace.id)
         workspace = refetch(i3, workspace)
 
     # Clean up state for empty workspaces.
@@ -543,6 +690,10 @@ def reflow_old_workspace(i3: i3ipc.Connection, new_workspace: i3ipc.Con) -> None
 
 
 def on_window_move(i3: i3ipc.Connection, event: i3ipc.Event) -> None:
+  # Skip all placeholder moves.
+  if ZOOM.is_placeholder(event.container.id):
+    return
+
   workspace = get_workspace_of_event(i3, event) or get_focused_workspace(i3)
   if not workspace:
     return
@@ -585,14 +736,14 @@ def cmd_promote(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
 
 def cmd_focus_next(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   ws = get_focused_workspace(i3)
-  if ws and STATE.get(ws).layout.zoomed_id is not None:
+  if ws and ZOOM.is_active_on(ws.id):
     zoom_cycle(i3, 1)
   else:
     focus_window(i3, 1)
 
 def cmd_focus_prev(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   ws = get_focused_workspace(i3)
-  if ws and STATE.get(ws).layout.zoomed_id is not None:
+  if ws and ZOOM.is_active_on(ws.id):
     zoom_cycle(i3, -1)
   else:
     focus_window(i3, -1)
@@ -639,137 +790,123 @@ def cmd_move_divider(i3: i3ipc.Connection, event: i3ipc.Event, direction: str, a
     state.layout.rcol_width = ws.nodes[1].rect.width
 
 def zoom_cycle(i3: i3ipc.Connection, offset: int) -> None:
-  """Cycle to next/prev window while staying in zoom mode."""
+  """Cycle to next/prev window while staying in zoom mode.
+
+  Unfloat the zoomed window, do two tiling↔tiling swaps to rearrange,
+  then float the new target. All commands batched in one IPC call.
+  """
   ws = get_focused_workspace(i3)
   if not ws:
     return
-  state = STATE.get(ws)
-
-  tiling = tiling_leaves(ws)
-  if not tiling:
+  zoom_info = ZOOM.get_zoom(ws.id)
+  if not zoom_info:
     return
+
+  tree = i3.get_tree()
+  zoomed = tree.find_by_id(zoom_info.zoomed_id)
+  placeholder = tree.find_by_id(zoom_info.placeholder_con_id)
+  if not zoomed or not placeholder:
+    return
+
+  source_ws = tree.find_by_id(zoom_info.source_workspace_id)
+  if not source_ws:
+    return
+
+  # Find next/prev tiling window, stepping from placeholder's position
+  # (which represents the zoomed window's logical slot).
+  tiling = tiling_leaves(source_ws)
   ids = [l.id for l in tiling]
-
-  # Find zoomed window's logical position among all windows.
-  if state.layout.zoom_neighbor_id is not None and state.layout.zoom_neighbor_id in ids:
-    insert_idx = ids.index(state.layout.zoom_neighbor_id)
-  else:
-    insert_idx = len(tiling)
-
-  n = len(tiling) + 1
-  target_logical = (insert_idx + offset) % n
-  if target_logical == insert_idx:
+  try:
+    p_idx = ids.index(zoom_info.placeholder_con_id)
+  except ValueError:
     return
 
-  # Map logical index to actual tiling window.
-  if target_logical < insert_idx:
-    target = tiling[target_logical]
-  else:
-    target = tiling[target_logical - 1]
+  target = None
+  n = len(tiling)
+  for step in range(1, n):
+    candidate = tiling[(p_idx + offset * step) % n]
+    if not ZOOM.is_placeholder(candidate.id):
+      target = candidate
+      break
+  if target is None:
+    return
 
-  # Compute new zoom_neighbor in the full logical order.
-  next_pos = target_logical + 1
-  if next_pos >= n:
-    new_neighbor_id = None
-  elif next_pos == insert_idx:
-    new_neighbor_id = state.layout.zoomed_id
-  elif next_pos < insert_idx:
-    new_neighbor_id = ids[next_pos]
-  else:
-    new_neighbor_id = ids[next_pos - 1]
-
-  old_zoomed_id = state.layout.zoomed_id
-  old_neighbor_id = state.layout.zoom_neighbor_id
-
-  # Float target FIRST — it covers the workspace immediately,
-  # hiding all subsequent tiling changes from the user.
-  r = ws.rect
+  # Unfloat zoomed so all swaps are tiling↔tiling.
+  zoomed.command("floating disable")
+  # Swap 1: zoomed ↔ target. Zoomed lands in target's slot.
+  zoomed.command(f"swap container with con_id {target.id}")
+  # Swap 2: placeholder ↔ zoomed. Zoomed returns to its original slot,
+  # placeholder moves to target's old slot.
+  placeholder.command(f"swap container with con_id {zoomed.id}")
+  # Float the new target to zoom it.
+  r = source_ws.rect
   target.command(
     f"floating enable, border none, "
     f"resize set {r.width} px {r.height} px, "
-    f"move absolute position {r.x} px {r.y} px"
-  )
+    f"move absolute position {r.x} px {r.y} px, "
+    f"focus")
+  zoomed.command("border pixel 2")
 
-  # Unfloat old zoomed window (now hidden behind the new zoom).
-  zoomed = i3.get_tree().find_by_id(old_zoomed_id)
-  if zoomed:
-    zoomed.command("floating disable, border pixel 2")
+  zoom_info.zoomed_id = target.id
 
-  # Update zoom state.
-  state.layout.zoomed_id = target.id
-  state.layout.zoom_neighbor_id = new_neighbor_id
-
-  # Reflow and restore old zoomed window's tiling position.
-  do_reflow(i3, state)
-  if old_neighbor_id is not None:
-    ws = refetch(i3, ws)
-    if ws:
-      old_zoomed = ws.find_by_id(old_zoomed_id)
-      if old_zoomed:
-        leaf_ids = [l.id for l in tiling_leaves(ws)]
-        if old_neighbor_id in leaf_ids:
-          neighbor = ws.find_by_id(old_neighbor_id)
-          if neighbor:
-            move_before(state, old_zoomed, neighbor)
-            do_reflow(i3, state)
-
-  state.snapshot = refetch(i3, ws)
+  source_ws = refetch(i3, source_ws)
+  if source_ws:
+    STATE.get(source_ws).snapshot = source_ws
 
 
 def cmd_zoom(i3: i3ipc.Connection, event: i3ipc.Event, *args) -> None:
   ws = get_focused_workspace(i3)
   if not ws:
     return
-  state = STATE.get(ws)
   focused = ws.find_focused()
   if not focused:
     return
 
-  # Toggle off: unzoom
-  if state.layout.zoomed_id is not None:
-    zoomed = i3.get_tree().find_by_id(state.layout.zoomed_id)
-    if zoomed:
-      zoomed.command("floating disable, border pixel 2")
-      do_reflow(i3, state)
-      # Restore position next to saved neighbor
-      if state.layout.zoom_neighbor_id is not None:
-        ws = refetch(i3, ws)
-        if ws:
-          leaf_ids = [l.id for l in tiling_leaves(ws)]
-          zoomed = refetch(i3, zoomed)
-          if zoomed and state.layout.zoom_neighbor_id in leaf_ids:
-            neighbor = i3.get_tree().find_by_id(state.layout.zoom_neighbor_id)
-            if neighbor:
-              move_before(state, zoomed, neighbor)
-              do_reflow(i3, state)
-      zoomed = refetch(i3, zoomed)
-      if zoomed:
-        zoomed.command("focus")
-    state.layout.clear_zoom()
-    state.snapshot = refetch(i3, ws)
+  # Toggle off: unzoom on current workspace.
+  zoom_info = ZOOM.get_zoom(ws.id)
+  if zoom_info:
+    zoomed = i3.get_tree().find_by_id(zoom_info.zoomed_id)
+    placeholder = i3.get_tree().find_by_id(zoom_info.placeholder_con_id)
+    if zoomed and placeholder:
+      zoomed.command("floating disable")
+      zoomed.command(
+        f"swap container with con_id {placeholder.id}, border pixel 2, focus")
+      i3.command(f"[con_id={placeholder.id}] move to scratchpad")
+      ZOOM.return_placeholder(placeholder.id)
+    ZOOM.end_zoom(ws.id)
+    ws = refetch(i3, ws) if ws else get_focused_workspace(i3)
+    if ws:
+      STATE.get(ws).snapshot = ws
     return
 
-  # Toggle on: zoom (skip if only one window)
-  if len(ws.leaves()) <= 1:
+  # Toggle on: zoom
+  if len(tiling_leaves(ws)) <= 1:
     return
-  state.layout.zoomed_id = focused.id
-  # Find next window in tiling order for position restore (without wrapping)
-  leaves = ws.leaves()
-  leaf_ids = [l.id for l in leaves]
-  try:
-    idx = leaf_ids.index(focused.id)
-    state.layout.zoom_neighbor_id = leaf_ids[idx + 1] if idx + 1 < len(leaf_ids) else None
-  except ValueError:
-    state.layout.zoom_neighbor_id = None
-  # Float and fill workspace rect (oversize to defeat terminal size hints)
+
+  placeholder_id = ZOOM.take_placeholder()
+  if placeholder_id is None:
+    logging.warning("No placeholder available for zoom.")
+    return
+
+  # Bring placeholder from scratchpad, unfloat it so both are tiling, swap,
+  # then float focused to zoom it.
   r = ws.rect
+  i3.command(
+    f"[con_id={placeholder_id}] move to workspace {ws.name}, "
+    f"floating disable")
+  focused.command(f"swap container with con_id {placeholder_id}")
   focused.command(
     f"floating enable, border none, "
     f"resize set {r.width} px {r.height} px, "
-    f"move absolute position {r.x} px {r.y} px"
-  )
-  do_reflow(i3, state)
-  state.snapshot = refetch(i3, ws)
+    f"move absolute position {r.x} px {r.y} px, "
+    f"focus")
+
+  ZOOM.start_zoom(ws.id, focused.id, placeholder_id, ws.name)
+  ZOOM.ensure_pool()
+
+  ws = refetch(i3, ws)
+  if ws:
+    STATE.get(ws).snapshot = ws
 
 
 COMMANDS = {
@@ -872,6 +1009,11 @@ if __name__ == "__main__":
   i3 = Connection(delay=cmd_args.delay)
 
   STATE.initialize(i3)
+
+  logging.info("Spawning placeholder window...")
+  if not ZOOM.spawn_initial(i3):
+    logging.error("Could not spawn placeholder. Zoom will not work.")
+  atexit.register(ZOOM.kill_all)
 
   i3.on(i3ipc.Event.BINDING, on_binding)
   i3.on(i3ipc.Event.WINDOW_NEW, on_window_new)
